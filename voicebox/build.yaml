@@ -1,0 +1,7 @@
+# Build arguments passed to the Dockerfile.
+#
+# No `build_from:` here on purpose. Supervisor 2026.04.0 stopped injecting
+# BUILD_FROM automatically, and this add-on wraps the upstream Voicebox image
+# rather than a Home Assistant base image, so the Dockerfile pins its own FROM.
+args:
+  VOICEBOX_TAG: latest

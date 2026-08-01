@@ -1,0 +1,14 @@
+# Shell scripts and YAML must use LF. A CR on the shebang line makes Linux
+# report "bad interpreter: /usr/bin/env bash^M: no such file or directory",
+# which is exactly the kind of failure that only shows up after deployment.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+Dockerfile text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary

@@ -1,0 +1,27 @@
+configuration:
+  log_level:
+    name: Log level
+    description: >-
+      Verbosity of the Voicebox log. Use debug when investigating a problem.
+  min_free_ram_mb:
+    name: Minimum free RAM (MB)
+    description: >-
+      Refuse to start unless at least this much memory is actually available.
+      Default 8192, the minimum Voicebox states for a single engine. Set to 0 to
+      disable the check. Raise to 16384 if you run multiple engines at once.
+  allow_low_ram_start:
+    name: Allow start with insufficient RAM
+    description: >-
+      Downgrade the memory check from a hard stop to a warning. Risky — add-ons
+      are preferred OOM-kill targets, so starting short can take other add-ons
+      down with it. Read the documentation first.
+  cors_origins:
+    name: CORS origins
+    description: >-
+      Optional comma-separated list of allowed browser origins for the API.
+      Leave empty unless you are calling Voicebox from a web page hosted
+      elsewhere.
+network:
+  8000/tcp: >-
+    Voicebox web UI, REST API and MCP endpoint. NOTE: Voicebox has no
+    authentication of its own — only publish this on a trusted network.
