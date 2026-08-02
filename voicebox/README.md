@@ -30,7 +30,7 @@ https://github.com/ITSpecialist111/ha-addon-voicebox
 
 - Web UI behind Home Assistant authentication via ingress
 - REST API on port 17493
-- MCP endpoint at `/mcp` for AI agents
+- MCP endpoint at `/mcp` for AI agents — **not yet in the published image**; see DOCS.md
 - Profiles and generated audio persisted across updates
 - Model cache excluded from backups
 

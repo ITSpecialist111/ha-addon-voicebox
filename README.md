@@ -57,7 +57,7 @@ That allocation cannot be satisfied by any means, and the add-on correctly
 refuses. 16 GB of installed RAM is not the same as 8 GB of available RAM.
 
 If Voicebox does not fit alongside Home Assistant, the better pattern is to run
-it on a separate machine and point Home Assistant at it over REST or MCP. The
+it on a separate machine and point Home Assistant at it over REST. The
 service is designed to be used over the network.
 
 ## What the add-on adds over the upstream container

@@ -180,8 +180,10 @@ has not been verified against a running instance.
 **The Voicebox API has no authentication at all.** That includes:
 
 - the REST API
-- the `/mcp` endpoint
 - the web UI itself
+- `POST /shutdown`, which stops the service — no credentials required
+
+Confirmed on a live instance: every route answers without a token.
 
 Anything that can reach port 17493 can use your voice profiles, generate speech,
 and read anything Voicebox has generated.
@@ -250,10 +252,27 @@ Useful endpoints (no `/api` prefix — this comes from the project's own
 | POST | `/transcribe` | Speech to text |
 | GET | `/models/status` | What is loaded |
 | POST | `/models/unload` | **Free RAM** without stopping the add-on |
-| — | `/mcp` | MCP over Streamable HTTP |
+| POST | `/models/download` | Fetch a model |
+| GET | `/history` | Past generations |
+| POST | `/shutdown` | **Stops the service — unauthenticated** |
 
 `/models/unload` is worth knowing about on a tight machine — it releases model
 memory while leaving the service up.
+
+### `/mcp` is NOT available in the current published image
+
+Upstream documents an MCP endpoint at `/mcp` over Streamable HTTP. **The image
+this add-on builds on does not implement it.** Verified against the running
+container''s own `/openapi.json`: 50+ routes are present and `/mcp` is not among
+them. `GET /mcp` returns 404.
+
+The published `:latest` tag was built 2026-02-03 and has not moved since, so MCP
+appears to postdate it. Until upstream publishes a newer image, **use the REST
+API** — `/generate` plus `/profiles` covers everything needed to speak from Home
+Assistant.
+
+This will start working on its own when upstream refreshes the image; nothing in
+this add-on needs to change.
 
 ## Troubleshooting
 
@@ -262,7 +281,7 @@ memory while leaving the service up.
 Working as designed. The add-on log shows exactly how much was available, how
 much was needed, and how much swap was free. Options, best first:
 
-1. Run Voicebox on a machine with more RAM and point HA at it over REST/MCP.
+1. Run Voicebox on a machine with more RAM and point HA at it over REST.
 2. Stop other add-ons to free memory, then retry.
 3. Lower `min_free_ram_mb` if you have measured your actual need.
 4. Set `allow_low_ram_start: true` if you accept the risks above.
