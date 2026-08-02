@@ -92,8 +92,37 @@ RUN set -eux; \
     echo "--- pinning $(wc -l < /tmp/vb-constraints.txt) existing packages as constraints ---"; \
     python3 -m pip install --no-cache-dir --no-deps "qwen-tts==0.1.1"; \
     python3 -m pip install --no-cache-dir -c /tmp/vb-constraints.txt \
-        einops soundfile librosa onnxruntime sox torchaudio; \
+        einops soundfile librosa onnxruntime sox; \
     rm -f /tmp/vb-constraints.txt
+
+# torchaudio has to match torch's BUILD VARIANT, not just its version number.
+#
+# Installing it from PyPI looks correct and is not: the PyPI wheel is the CUDA
+# build, so it imports and then dies on `libcudart.so.13: cannot open shared
+# object file`, because this image carries a CPU-only torch with no CUDA
+# runtime. The version constraint cannot catch that — 2.11.0 satisfies 2.11.0
+# either way. The variant is encoded in torch's local version tag (+cpu, +cu128)
+# and only the matching index serves the matching wheel.
+#
+# So derive it from the installed torch rather than hardcoding, which keeps this
+# correct if the upstream image is ever rebuilt against a different torch, and
+# would pick up a GPU image automatically. --no-deps because torch is already
+# present and pinned; the exact-version retry covers PyTorch dropping the local
+# tag for a release.
+RUN set -eux; \
+    TORCH_VER="$(python3 -c 'import torch; print(torch.__version__)')"; \
+    BASE="${TORCH_VER%%+*}"; \
+    VARIANT="${TORCH_VER#*+}"; \
+    if [ "$VARIANT" = "$TORCH_VER" ]; then VARIANT=""; fi; \
+    echo "--- torch ${TORCH_VER} (base ${BASE}, variant ${VARIANT:-none}) ---"; \
+    if [ -n "$VARIANT" ]; then \
+        IDX="https://download.pytorch.org/whl/${VARIANT}"; \
+        python3 -m pip install --no-cache-dir --no-deps --index-url "$IDX" "torchaudio==${TORCH_VER}" \
+            || python3 -m pip install --no-cache-dir --no-deps --index-url "$IDX" "torchaudio==${BASE}"; \
+    else \
+        python3 -m pip install --no-cache-dir --no-deps "torchaudio==${BASE}"; \
+    fi; \
+    python3 -c "import torchaudio; print('torchaudio', torchaudio.__version__, 'loads against this torch')"
 
 # Prove both halves still work before shipping the image.
 #
