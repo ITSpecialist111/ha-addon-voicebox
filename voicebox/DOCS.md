@@ -5,9 +5,29 @@ and transcription, running entirely on your own hardware.
 
 ## Read this first: will it fit?
 
-**Voicebox needs about 8 GB of RAM free, on top of everything Home Assistant is
-already running.** That is a genuinely large amount for a typical HA box, and
-it is the single thing most likely to stop this working for you.
+**It depends entirely on which model you use, and upstream defaults to the one
+that does not fit.**
+
+Voicebox ships two text-to-speech models. These are measured figures from a
+16 GB Home Assistant box running Frigate and 18 other add-ons, not numbers
+copied from documentation:
+
+| Model | Peak RAM | Result |
+|---|---|---|
+| `0.6B` | **4220 MB** | loaded in 26 s — works |
+| `1.7B` | **~8130 MB** | OOM-killed, twice |
+
+Idle usage, with no model loaded, is about **600 MB**. The large figures are
+peaks *during a model load*, not resident usage.
+
+Upstream defaults every entry point to `1.7B` — the `/generate` request body,
+its internal fallback, the `/models/load` query parameter, and the backend
+constructor that an unqualified load falls through to. So out of the box, the
+default action of the web UI is the one that cannot work on a machine this
+size. **This add-on rewrites those defaults to `0.6B` at build time and refuses
+the large model with a clear HTTP error** rather than letting it invite the OOM
+killer. See [`allow_large_model`](#allow_large_model) if your host really can
+spare 8 GB.
 
 Home Assistant add-ons **cannot be given a memory limit**. There is no such
 option in the add-on schema, and the Supervisor does not pass any memory
@@ -136,6 +156,23 @@ its own sake. If it says you are short, then starting Voicebox means one of:
 Enable it if you are testing, or if you genuinely know better than the estimate.
 Do not enable it to make an error message go away on a machine that is already
 tight.
+
+### `allow_large_model`
+
+Default `false`. Leave it there unless you have measured your own headroom.
+
+`false` permits only the `0.6B` model. Any attempt to load `1.7B` — from the
+UI, from the REST API, or indirectly while building a voice prompt — returns
+HTTP 400 with an explanation, instead of allocating ~8 GB and being killed.
+
+`true` permits both. Only do this if the host genuinely has ~8 GB spare. An
+out-of-memory event here is not contained to Voicebox: add-ons carry
+`oom_score_adj=200`, so the kernel prefers them as victims, and the practical
+casualty is whatever else is large — usually Frigate.
+
+The enforcement is not advisory. At build time the image is patched at the one
+function every model load passes through, and the build fails if that function
+has moved. See `enforce-model-policy.py`.
 
 ### `cpu_priority`
 

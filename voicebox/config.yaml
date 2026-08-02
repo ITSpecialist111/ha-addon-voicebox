@@ -1,5 +1,5 @@
 name: Voicebox
-version: "0.5.0"
+version: "0.6.0"
 slug: voicebox
 description: >-
   Local AI voice studio — text-to-speech, voice cloning and transcription.
@@ -64,6 +64,7 @@ options:
   allow_low_ram_start: false
   cors_origins: ""
   cpu_priority: low
+  allow_large_model: false
 
 schema:
   log_level: list(debug|info|warning|error)
@@ -78,3 +79,10 @@ schema:
   # 'low' runs it under nice 19 so it yields whenever anything else wants the
   # CPU. Only affects behaviour when the CPU is actually contended.
   cpu_priority: list(low|normal)
+  # Voicebox ships two TTS models. Measured on this class of hardware:
+  #   0.6B  ~4.2 GB peak  -> fits
+  #   1.7B  ~8.1 GB peak  -> OOM-killed
+  # Upstream defaults every entry point to 1.7B, so the build rewrites those
+  # defaults and guards the loader. Leave this false unless the host really
+  # can spare ~8.1 GB; an OOM here takes other add-ons with it.
+  allow_large_model: bool

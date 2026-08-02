@@ -61,6 +61,7 @@ MIN_FREE_RAM_MB="$(get_opt min_free_ram_mb 8192)"
 ALLOW_LOW_RAM="$(get_opt allow_low_ram_start false)"
 CORS_ORIGINS="$(get_opt cors_origins '')"
 CPU_PRIORITY="$(get_opt cpu_priority low)"
+ALLOW_LARGE_MODEL="$(get_opt allow_large_model false)"
 
 # Guard against a non-numeric value reaching the arithmetic below.
 [[ "$MIN_FREE_RAM_MB" =~ ^[0-9]+$ ]] || MIN_FREE_RAM_MB=8192
@@ -248,14 +249,40 @@ if [[ -r /app/.voicebox-inventory.txt ]]; then
     log "--- end inventory ---"
 fi
 
+# Model size policy.
+#
 # Measured on this hardware, not taken from documentation:
-#   0.6B  peaks ~4.2 GB, loads in ~25 s        -> fits
-#   1.7B  peaks ~8.1 GB, OOM-killed twice      -> does NOT fit
-# Both /models/load and /generate default model_size to "1.7B", so any request
-# that omits it asks for the one that cannot fit.
-warn "IMPORTANT: pass model_size=0.6B on /models/load and /generate."
-warn "  Both default to 1.7B, which needs ~8.1 GB here and will be"
-warn "  OOM-killed. The 0.6B model peaks at ~4.2 GB and works."
+#   0.6B  peaks ~4.2 GB, loaded in ~26 s   -> fits
+#   1.7B  peaks ~8.1 GB, OOM-killed twice  -> does NOT fit
+#
+# Upstream defaults BOTH /models/load and /generate to 1.7B, so the default
+# action of the web UI was the one that cannot work here. Worse, creating a
+# voice prompt calls the loader with no size at all, which fell through to the
+# backend's own 1.7B default - so even an explicit 0.6B request could load the
+# wrong model first.
+#
+# enforce-model-policy.py rewrote those defaults at build time and put a guard
+# in load_model_async, the single function every TTS load funnels through. An
+# over-large request now returns a clean HTTP 400 instead of inviting the OOM
+# killer. The guard reads the policy from the variable exported below.
+if [[ ! -r /app/.voicebox-model-policy.json ]]; then
+    warn "model policy receipt is missing — this image predates the 1.7B guard."
+    warn "  Rebuild the add-on. Until then, ALWAYS pass model_size=0.6B by hand:"
+    warn "  the 1.7B default needs ~8.1 GB here and will be OOM-killed."
+fi
+
+if [[ "$ALLOW_LARGE_MODEL" == "true" ]]; then
+    export VOICEBOX_ALLOWED_MODEL_SIZES="0.6B,1.7B"
+    warn "allow_large_model is ON — the 1.7B model may be loaded."
+    warn "  It peaked at ~8.1 GB on this box and was OOM-killed twice. Home"
+    warn "  Assistant biases the kernel to kill add-ons first, so this risks"
+    warn "  Frigate and every other add-on, not just Voicebox."
+else
+    export VOICEBOX_ALLOWED_MODEL_SIZES="0.6B"
+    log "model policy: 0.6B only (~4.2 GB peak); 1.7B is refused with an HTTP"
+    log "  error rather than risking the OOM killer. Set allow_large_model to"
+    log "  true only if this host really can spare ~8.1 GB."
+fi
 
 log "Voicebox starting — log level ${LOG_LEVEL}"
 log "models cached in $DATA_ROOT/cache/huggingface (excluded from backups)"

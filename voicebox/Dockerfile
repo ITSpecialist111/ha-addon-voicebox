@@ -26,7 +26,7 @@ FROM ghcr.io/jamiepine/voicebox:${VOICEBOX_TAG}
 # explicit by necessity as well as by preference.
 
 ARG BUILD_ARCH=amd64
-ARG BUILD_VERSION=0.5.0
+ARG BUILD_VERSION=0.6.0
 
 # tini gives correct signal forwarding and zombie reaping, so uvicorn actually
 # receives SIGTERM when Home Assistant stops the add-on.
@@ -178,6 +178,33 @@ RUN python3 /usr/local/bin/patch-frontend.py /app
 COPY inventory.py /usr/local/bin/inventory.py
 RUN set -eux; \
     python3 /usr/local/bin/inventory.py /app/backend /app/.voicebox-inventory.txt
+
+# ---------------------------------------------------------------------------
+# Model size policy
+# ---------------------------------------------------------------------------
+# Voicebox ships two TTS models. Measured on the target hardware:
+#
+#     0.6B    peak 4220 MB    loaded in 26 s      works
+#     1.7B    peak ~8130 MB   OOM-killed twice    does not fit
+#
+# Upstream defaults to 1.7B at every entry point - the /generate request model,
+# the /generate fallback, the /models/load query parameter, and the backend
+# constructor that an unqualified load falls through to. So the DEFAULT action
+# of the web UI was the one that cannot work here, and because Supervisor sets
+# oom_score_adj=200 on add-ons the kernel kills add-ons first: an oversized
+# Voicebox endangers Frigate, the NVR, not just itself.
+#
+# enforce-model-policy.py rewrites those defaults and guards load_model_async,
+# the one function every TTS load funnels through. Refusals become HTTP errors.
+#
+# Two RUN steps, both in exec form. Exec form means no shell is involved, so
+# nothing can mask a non-zero exit - which is exactly how the previous patch in
+# this repository failed silently and shipped an image that was OOM-killed in
+# production. --apply refuses to touch a file whose SHA-256 has moved, and
+# --verify re-checks the result behaviourally afterwards.
+COPY enforce-model-policy.py /usr/local/bin/enforce-model-policy.py
+RUN ["python3", "/usr/local/bin/enforce-model-policy.py", "--apply"]
+RUN ["python3", "/usr/local/bin/enforce-model-policy.py", "--verify"]
 
 COPY run.sh /run.sh
 RUN chmod +x /run.sh && sed -i 's/\r$//' /run.sh

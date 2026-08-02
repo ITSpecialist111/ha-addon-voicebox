@@ -1,0 +1,4 @@
+
+# Backend source extracted from the pinned upstream image, used to
+# develop and test enforce-model-policy.py. Not ours to redistribute.
+.imgsrc/

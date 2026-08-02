@@ -30,6 +30,16 @@ configuration:
       they need the CPU. Recommended when something latency-sensitive such as
       Frigate shares the machine: voice generation gets slower under load rather
       than the NVR dropping frames. Normal competes on equal terms.
+  allow_large_model:
+    name: Allow the large (1.7B) model
+    description: >-
+      Voicebox ships two text-to-speech models. On a 16 GB machine the small
+      one (0.6B) peaks at about 4.2 GB and works; the large one (1.7B) peaks at
+      about 8.1 GB and gets killed by the kernel. Upstream defaults every entry
+      point to the large one, so this add-on rewrites those defaults and
+      refuses the large model with a clear error instead. Turn this on only if
+      the host really can spare 8 GB — add-ons are the kernel's preferred
+      victims, so an out-of-memory event here can take Frigate down with it.
 network:
   8000/tcp: >-
     Voicebox web UI and REST API. NOTE: Voicebox has no authentication of its
