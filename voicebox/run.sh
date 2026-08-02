@@ -239,6 +239,24 @@ if [[ "$link_ok" != true ]]; then
     ln -sfn "$DATA_ROOT/app-data" "$APP_ROOT/data"
 fi
 
+# The build records what this image's model-loading code actually looks like.
+# Print it: two fixes have now been aimed at files taken from upstream's GitHub
+# that turned out not to exist in the published tag.
+if [[ -r /app/.voicebox-inventory.txt ]]; then
+    log "--- image inventory (recorded at build time) ---"
+    while IFS= read -r inv_line; do log "  $inv_line"; done < /app/.voicebox-inventory.txt
+    log "--- end inventory ---"
+fi
+
+# Measured on this hardware, not taken from documentation:
+#   0.6B  peaks ~4.2 GB, loads in ~25 s        -> fits
+#   1.7B  peaks ~8.1 GB, OOM-killed twice      -> does NOT fit
+# Both /models/load and /generate default model_size to "1.7B", so any request
+# that omits it asks for the one that cannot fit.
+warn "IMPORTANT: pass model_size=0.6B on /models/load and /generate."
+warn "  Both default to 1.7B, which needs ~8.1 GB here and will be"
+warn "  OOM-killed. The 0.6B model peaks at ~4.2 GB and works."
+
 log "Voicebox starting — log level ${LOG_LEVEL}"
 log "models cached in $DATA_ROOT/cache/huggingface (excluded from backups)"
 log "first start downloads several GB of models; this takes a while"
