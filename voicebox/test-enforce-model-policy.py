@@ -77,12 +77,17 @@ class Sandbox:
     def path(self, rel):
         return os.path.join(self.root, rel)
 
+    # newline="" on BOTH sides. Without it Python rewrites \n as \r\n on write
+    # and back again on read, so on Windows the sandbox holds CRLF while every
+    # hash computed from read() is over LF. The patcher reads raw, so the two
+    # disagree and tests that mean to exercise the AST assertions trip the hash
+    # gate instead - passing, loudly, for entirely the wrong reason.
     def read(self, rel):
-        with open(self.path(rel), encoding="utf-8") as fh:
+        with io.open(self.path(rel), encoding="utf-8", newline="") as fh:
             return fh.read()
 
     def write(self, rel, text):
-        with open(self.path(rel), "w", encoding="utf-8") as fh:
+        with io.open(self.path(rel), "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
 
     def sub(self, rel, old, new, expected=1, count=-1):
@@ -212,6 +217,9 @@ def main():
               "guard precedes unload_model, so a refusal cannot drop a working model")
 
     # ---------------------------------------------------------------
+    def nl_of(t):
+        return "\r\n" if "\r\n" in t else "\n"
+
     print("\n4b. MUTATION: a verifier that cannot fail is not a verifier")
     # Each mutation refreshes the receipt hash, so the hash gate cannot be what
     # fails - these test the SEMANTIC assertions.
@@ -229,6 +237,23 @@ def main():
         ("policy helper neutered", "backends/pytorch_backend.py",
          lambda t: t.replace("    if model_size in allowed:\n        return model_size\n",
                              "    return model_size\n")),
+        # The next three are the shapes an EXISTENCE check accepts. Each keeps
+        # a call to the right function, in the right place, in the right order
+        # - and each enforces precisely nothing.
+        ("guard called on a constant, not the requested size",
+         "backends/pytorch_backend.py",
+         lambda t: t.replace(GUARD_CALL,
+                             GUARD_CALL.replace("(model_size)", '("0.6B")'))),
+        ("guard buried in a branch that never runs",
+         "backends/pytorch_backend.py",
+         lambda t: t.replace(
+             GUARD_CALL,
+             nl_of(t) + "        if False:" + nl_of(t) +
+             "    " + GUARD_CALL.strip(nl_of(t)) + nl_of(t))),
+        ("provider guard reduced to a bare call", "main.py",
+         lambda t: t.replace(
+             PROVIDER_GUARD_TXT,
+             nl_of(t) + "    _vb_external_providers_allowed()" + nl_of(t), 1)),
     )
     for label, rel, mutate in mutations:
         with Sandbox(source) as s:
@@ -359,8 +384,6 @@ def main():
         io.open(alt, "w", encoding="utf-8").write(src)
         return alt
 
-    import io
-
     for rel, old_text, new_text, why, n_expected, n_count in (
         # This anchor exists in BOTH the TTS and the Whisper loader, which is
         # precisely why the patcher resolves it through the class rather than
@@ -392,6 +415,11 @@ def main():
                   "refuses %s even with hashes refreshed" % why, a.stdout)
             check("MODEL POLICY FAILED" in a.stderr,
                   "  ...loudly", a.stderr[:160])
+            # The whole point of refreshing the hashes is to get PAST the hash
+            # gate. If this still fires, the test proves nothing about the AST
+            # assertions it is meant to exercise.
+            check("has changed upstream" not in a.stderr,
+                  "  ...from the AST checks, not the hash gate", a.stderr[:200])
             check(not os.path.exists(s.receipt), "  ...and writes no receipt")
 
     # ---------------------------------------------------------------

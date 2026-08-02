@@ -71,7 +71,7 @@ SwapFree:       $(( swap_mb * 1024 )) kB
 EOF
 
     # Stub uvicorn so the final exec is observable instead of fatal.
-    printf '#!/usr/bin/env bash\necho "UVICORN_STARTED args:$*"\n' > "$box/bin/uvicorn"
+    printf '#!/usr/bin/env bash\necho "UVICORN_STARTED args:$*"\necho "SIZES=[${VOICEBOX_ALLOWED_MODEL_SIZES:-unset}]"\n' > "$box/bin/uvicorn"
     chmod +x "$box/bin/uvicorn"
 
     # The model-policy gate fails CLOSED, so a sandbox with no receipt would
@@ -211,6 +211,46 @@ out="$(run_case 12000 4096 '{"min_free_ram_mb":11000,"allow_large_model":true}')
 check_absent "does not warn"        "min_free_ram_mb is only" "$out"
 check        "keeps the user value" "need 11000 MB"           "$out"
 check        "starts"               "UVICORN_STARTED"         "$out"
+
+# ---------------------------------------------------------------------------
+# The floor is only worth having if it cannot be walked around. Three settings
+# would otherwise grant 1.7B without the memory ever being looked at. In each
+# case the add-on must still START - the user's choice about starting is
+# honoured - while 1.7B stays refused.
+printf -- '\n--- 4i. allow_large_model + min_free_ram_mb=0: starts, withholds 1.7B ---\n'
+out="$(run_case 500 0 '{"min_free_ram_mb":0,"allow_large_model":true}')"
+check        "warns the pair is contradictory" "which disables the"        "$out"
+check        "skips the check as asked"        "RAM preflight disabled"    "$out"
+check        "starts"                          "UVICORN_STARTED"           "$out"
+check        "withholds the large model"       "1.7B stays REFUSED"        "$out"
+check        "exports 0.6B only"               "SIZES=[0.6B]"              "$out"
+check_absent "never grants 1.7B"               "SIZES=[0.6B,1.7B]"         "$out"
+check_rc     "exits cleanly"                   "0"
+
+printf -- '\n--- 4j. allow_large_model + allow_low_ram_start: starts, withholds 1.7B ---\n'
+out="$(run_case 900 0 '{"allow_large_model":true,"allow_low_ram_start":true}')"
+check        "raises the floor"          "need 9600 MB"        "$out"
+check        "warns it is short"         "SHORT of the"        "$out"
+check        "starts anyway, as asked"   "UVICORN_STARTED"     "$out"
+check        "withholds the large model" "1.7B stays REFUSED"  "$out"
+check_absent "never grants 1.7B"         "SIZES=[0.6B,1.7B]"   "$out"
+check_rc     "exits cleanly"             "0"
+
+printf -- '\n--- 4k. allow_large_model + unmeasurable RAM + override: withholds 1.7B ---\n'
+PREP_HOOK='rm -f "$box/meminfo"'
+out="$(run_case 12000 4096 '{"allow_large_model":true,"allow_low_ram_start":true}')"
+PREP_HOOK=''
+check        "starts on the override"    "UVICORN_STARTED"     "$out"
+check        "withholds the large model" "1.7B stays REFUSED"  "$out"
+check        "exports 0.6B only"         "SIZES=[0.6B]"        "$out"
+check_absent "never grants 1.7B"         "SIZES=[0.6B,1.7B]"   "$out"
+
+printf -- '\n--- 4l. measured and sufficient: 1.7B IS granted ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":9600,"allow_large_model":true}')"
+check        "verified the memory"  "Verified"          "$out"
+check        "grants the model"     "SIZES=[0.6B,1.7B]" "$out"
+check_absent "no withholding note"  "stays REFUSED"     "$out"
+check        "starts"               "UVICORN_STARTED"   "$out"
 
 # ---------------------------------------------------------------------------
 printf -- '\n--- 5. malformed options.json: defaults, no crash-loop ---\n'

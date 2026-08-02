@@ -78,6 +78,20 @@ ALLOW_LARGE_MODEL="$(get_opt allow_large_model false)"
 # So opting in to the large model also raises the floor. The user asked to be
 # ALLOWED to load it, not to be allowed to crash the box trying.
 LARGE_MODEL_FLOOR_MB=9600
+
+# Set only when the preflight actually READ the memory and found enough of it.
+# Permission to load 1.7B is granted from this, not from the option alone, so
+# every path that skips or waives the check also withholds the large model.
+LARGE_MODEL_RAM_VERIFIED=false
+
+if [[ "$ALLOW_LARGE_MODEL" == "true" ]] && (( MIN_FREE_RAM_MB == 0 )); then
+    warn "allow_large_model is on but min_free_ram_mb is 0, which disables the"
+    warn "  RAM check entirely. The two together mean \"load an 8.1 GB model"
+    warn "  without looking\", which is how this box was OOM-killed twice."
+    warn "  The add-on will start, but 1.7B stays refused. Set min_free_ram_mb"
+    warn "  to ${LARGE_MODEL_FLOOR_MB} or more to actually enable it."
+fi
+
 if [[ "$ALLOW_LARGE_MODEL" == "true" ]] && (( MIN_FREE_RAM_MB != 0 )) \
    && (( MIN_FREE_RAM_MB < LARGE_MODEL_FLOOR_MB )); then
     warn "allow_large_model is on, but min_free_ram_mb is only ${MIN_FREE_RAM_MB} MB."
@@ -155,6 +169,12 @@ ram_preflight() {
 
     if (( avail_mb >= MIN_FREE_RAM_MB )); then
         log "RAM preflight passed."
+        # Real numbers, read and compared. This is the ONLY place the large
+        # model can earn permission: cannot_determine, min_free_ram_mb=0 and
+        # allow_low_ram_start all return without setting it.
+        if (( MIN_FREE_RAM_MB >= LARGE_MODEL_FLOOR_MB )); then
+            LARGE_MODEL_RAM_VERIFIED=true
+        fi
         return 0
     fi
 
@@ -318,12 +338,34 @@ else
     fail "refusing to start without a verifiable model guard. Rebuild the add-on."
 fi
 
-if [[ "$ALLOW_LARGE_MODEL" == "true" ]]; then
+# Permission is granted from the MEASUREMENT, not from the option.
+#
+# allow_large_model says "I want 1.7B available". It does not say "I want it
+# available on a box that cannot hold it". Three settings would otherwise have
+# waved it through unmeasured — min_free_ram_mb=0 (check disabled),
+# allow_low_ram_start=true (shortfall downgraded to a warning), and an
+# unreadable /proc/meminfo — and each of those is precisely when granting it is
+# most dangerous. An OOM here kills Frigate as readily as Voicebox.
+#
+# So the add-on still starts, honouring the user's choice about STARTING, but
+# 1.7B stays refused until the memory has actually been seen.
+if [[ "$ALLOW_LARGE_MODEL" == "true" && "$LARGE_MODEL_RAM_VERIFIED" == "true" ]]; then
     export VOICEBOX_ALLOWED_MODEL_SIZES="0.6B,1.7B"
     warn "allow_large_model is ON — the 1.7B model may be loaded."
+    warn "  Verified ≥${LARGE_MODEL_FLOOR_MB} MB available before starting."
     warn "  It peaked at ~8.1 GB on this box and was OOM-killed twice. Home"
     warn "  Assistant biases the kernel to kill add-ons first, so this risks"
     warn "  Frigate and every other add-on, not just Voicebox."
+elif [[ "$ALLOW_LARGE_MODEL" == "true" ]]; then
+    export VOICEBOX_ALLOWED_MODEL_SIZES="0.6B"
+    warn "=========================================================="
+    warn "allow_large_model is ON, but the ${LARGE_MODEL_FLOOR_MB} MB the 1.7B model needs"
+    warn "was never confirmed — the RAM check was disabled, waived or"
+    warn "could not read /proc/meminfo. 1.7B stays REFUSED."
+    warn ""
+    warn "To enable it: set min_free_ram_mb to ${LARGE_MODEL_FLOOR_MB} or above, leave"
+    warn "allow_low_ram_start off, and restart. 0.6B is unaffected."
+    warn "=========================================================="
 else
     export VOICEBOX_ALLOWED_MODEL_SIZES="0.6B"
     log "model policy: 0.6B only (~4.2 GB peak); 1.7B is refused with an HTTP"

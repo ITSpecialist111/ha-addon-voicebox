@@ -177,6 +177,24 @@ more than that while a model is loading. So if you enable `allow_large_model`
 and leave `min_free_ram_mb` below 9600, the add-on raises it to 9600 for that
 start and says so. Set it explicitly above 9600 to take control back.
 
+**The option is a request, not a grant.** 1.7B only becomes available once the
+add-on has actually read `/proc/meminfo` and seen 9600 MB free. Three settings
+would otherwise hand it over without ever looking:
+
+| setting | effect on the check | 1.7B |
+|---|---|---|
+| `min_free_ram_mb: 0` | disabled entirely | **withheld** |
+| `allow_low_ram_start: true` | shortfall downgraded to a warning | **withheld** |
+| `/proc/meminfo` unreadable | nothing to measure | **withheld** |
+
+In each case the add-on still **starts** — whether to start is your decision —
+but the model needing 8.1 GB stays refused, and the log says so in full. To
+enable it: set `min_free_ram_mb` to 9600 or above, leave `allow_low_ram_start`
+off, and restart. `0.6B` is unaffected throughout.
+
+"I could not measure it" is not "there is enough", and the consequence of
+conflating the two is not confined to Voicebox.
+
 The enforcement is not advisory. At build time the image is patched at the one
 function every model load passes through, and the build fails if that function
 has moved. See `enforce-model-policy.py`.

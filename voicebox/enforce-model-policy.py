@@ -277,6 +277,72 @@ def attr_named(name):
     return lambda n: isinstance(n, ast.Attribute) and n.attr == name
 
 
+def assert_direct_call(fn, idx, name, argname, where, why):
+    """Assert fn.body[idx] IS `name(argname)`, not merely that it contains it.
+
+    stmt_index matches anywhere in a statement's subtree, which is too weak on
+    its own. Both `if False: guard(size)` and `guard("0.6B")` satisfy it while
+    guarding nothing at all. Pinning the exact shape the patcher emits means a
+    guard that has decayed into a no-op fails verification instead of passing
+    it. That decay is not hypothetical: 0.4.0 shipped a patch that applied
+    cleanly, reported success, and did nothing.
+    """
+    st = fn.body[idx]
+    ok = (
+        isinstance(st, ast.Expr)
+        and isinstance(st.value, ast.Call)
+        and getattr(st.value.func, "id", None) == name
+        and not st.value.keywords
+        and len(st.value.args) == 1
+        and isinstance(st.value.args[0], ast.Name)
+        and st.value.args[0].id == argname
+    )
+    if not ok:
+        raise PolicyError(
+            "%s: statement %d should be exactly `%s(%s)` but is %s - %s."
+            % (where, idx, name, argname, ast.dump(st)[:140], why)
+        )
+
+
+def assert_provider_guard(fn, idx, where):
+    """Assert fn.body[idx] IS the whole `if not allowed(): raise 403` guard.
+
+    Requiring only that _vb_external_providers_allowed() is CALLED first is too
+    weak: a bare call evaluates the policy, discards the answer, and starts the
+    provider anyway.
+    """
+    st = fn.body[idx]
+    raised = st.body[0].exc if (
+        isinstance(st, ast.If) and len(st.body) == 1
+        and isinstance(st.body[0], ast.Raise)
+    ) else None
+    ok = (
+        isinstance(st, ast.If)
+        and not st.orelse
+        and isinstance(st.test, ast.UnaryOp)
+        and isinstance(st.test.op, ast.Not)
+        and isinstance(st.test.operand, ast.Call)
+        and getattr(st.test.operand.func, "id", None)
+            == "_vb_external_providers_allowed"
+        and isinstance(raised, ast.Call)
+        and getattr(raised.func, "id", None) == "HTTPException"
+        and any(
+            k.arg == "status_code"
+            and isinstance(k.value, ast.Constant)
+            and k.value.value == 403
+            for k in raised.keywords
+        )
+    )
+    if not ok:
+        raise PolicyError(
+            "%s: statement %d is not the expected guard "
+            "`if not _vb_external_providers_allowed(): raise HTTPException("
+            "status_code=403, ...)` - it is %s. A policy check whose result is "
+            "discarded refuses nothing."
+            % (where, idx, ast.dump(st)[:160])
+        )
+
+
 def find_class(tree, name, what):
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == name:
@@ -658,8 +724,15 @@ def verify(root):
                 "at statement %d but %s at statement %d - %s."
                 % (g, attr, i, why)
             )
+    assert_direct_call(
+        loader, g, "_vb_enforce_model_size", "model_size",
+        "pytorch_backend.py load_model_async",
+        "a guard that ignores the size it was asked for, or that sits inside a "
+        "branch which is not always taken, enforces nothing",
+    )
     checks.append(
         "load_model_async guard precedes both _load_model_sync and unload_model")
+    checks.append("load_model_async guard is a direct call on the requested size")
 
     init = find_method(cls, "__init__", "pytorch_backend.py")
     if any(
@@ -747,7 +820,9 @@ def verify(root):
                 "main.py: the %s policy check is at statement %d, expected %d "
                 "- work would happen before it." % (route, i, first)
             )
+        assert_provider_guard(fns[0], first, "main.py %s" % route)
     checks.append("/providers/start and /providers/download refuse before doing work")
+    checks.append("both provider guards raise 403 rather than discarding the answer")
 
     # behavioural: the provider helper honours the same env var
     ns2 = {}
