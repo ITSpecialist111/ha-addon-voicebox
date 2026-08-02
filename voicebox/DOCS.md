@@ -37,21 +37,45 @@ the kernel's own estimate of what can be handed out without swapping, which is
 exactly the question being asked. `free` looks alarmingly low on a healthy
 system because it excludes reclaimable page cache.
 
-A worked example from a real 16 GB machine running 19 add-ons including Frigate:
+Two readings from the *same* real 16 GB machine — an OptiPlex 3040 running 19
+add-ons including Frigate — taken weeks apart:
 
 ```
-Voicebox minimum          8192 MB
-Actually available        6482 MB
-Short by                  1710 MB
-Free swap                  817 MB
+                        after weeks up     7 h after a reboot
+Voicebox minimum           8192 MB             8192 MB
+Actually available         6482 MB             7194 MB
+Short by                   1710 MB              998 MB
+Free swap                   817 MB             4096 MB
+verdict                    REFUSE              START
 ```
 
-The shortfall is larger than the remaining swap, so the allocation cannot be
-satisfied at all — not by swapping, not by anything. On that machine the add-on
-refuses to start, and it is right to.
+Nothing was installed or removed between those two readings. The machine had
+simply been up long enough to accumulate 3.2 GB of paged-out memory, and the
+reboot returned it. In the first reading the shortfall exceeded free swap, so
+the allocation could not be satisfied by any means. In the second it is covered
+several times over.
 
-**16 GB is not automatically enough.** It depends entirely on what else you are
-running. Frigate alone can use 5 GB.
+The lesson: **measure, do not assume, and prefer a recently rebooted reading.**
+A long-uptime figure describes accumulated drift, not the actual requirement. If
+you are close to the line, reboot and measure again before concluding it will
+not fit.
+
+**16 GB is not automatically enough**, and it is not automatically insufficient
+either. It depends entirely on what else you are running. Frigate alone can use
+4–5 GB.
+
+### RAM is often not the real constraint — CPU is
+
+On the machine above, memory pressure sat at **0.00** while CPU sat at **86 %
+busy across 4 cores**, with CPU pressure at 18 %. There was enough RAM and not
+enough CPU.
+
+That matters because Voicebox inference is CPU-bound, and the other big consumer
+was Frigate doing camera detection. At equal priority the two simply take turns,
+and the visible symptom is not slow speech — it is **dropped frames on the
+NVR**. That is a much worse failure than a refused start, because it is silent.
+
+This is what `cpu_priority` is for, and why it defaults to `low`. See below.
 
 ## Installation
 
@@ -112,6 +136,23 @@ its own sake. If it says you are short, then starting Voicebox means one of:
 Enable it if you are testing, or if you genuinely know better than the estimate.
 Do not enable it to make an error message go away on a machine that is already
 tight.
+
+### `cpu_priority`
+
+`low` (default) or `normal`.
+
+Home Assistant applies **no CPU quota** to add-ons, in the same way it applies no
+memory limit — the Supervisor's container-create call sets `cpu_rt_runtime`,
+which is realtime scheduling headroom, not a general cap. So if a ceiling is
+wanted, the add-on has to impose it on itself.
+
+`low` starts Voicebox under `nice -n 19` and `ionice -c 3`. Both are free when
+the machine is idle: they only take effect when something else actually wants
+the resource. The practical effect is that under load Voicebox generation gets
+slower, instead of Frigate dropping frames or the UI going sluggish.
+
+Leave this on `low` unless Voicebox is the most important thing on the box. The
+only cost is generation latency while the machine is busy.
 
 ### `cors_origins`
 

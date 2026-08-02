@@ -47,10 +47,19 @@ check_rc() {
 }
 
 run_case() {
-    local avail_mb="$1" swap_mb="$2" opts_json="$3"
+    local avail_mb="$1" swap_mb="$2" opts_json="$3" stub_nice="${4:-}"
     local box; box="$(mktemp -d)"
 
     mkdir -p "$box/data" "$box/app/data" "$box/bin"
+
+    # nice/ionice are optional stubs. They announce themselves, drop their own
+    # flag pair, then exec the rest, so the whole wrapper chain shows up in the
+    # captured output exactly as it would be assembled at runtime.
+    if [[ -n "$stub_nice" ]]; then
+        printf '#!/usr/bin/env bash\necho "NICE_CALLED args:$*"\n[[ "$1" == "-n" ]] && shift 2\nexec "$@"\n' > "$box/bin/nice"
+        printf '#!/usr/bin/env bash\necho "IONICE_CALLED args:$*"\n[[ "$1" == "-c" ]] && shift 2\nexec "$@"\n' > "$box/bin/ionice"
+        chmod +x "$box/bin/nice" "$box/bin/ionice"
+    fi
     printf '%s' "$opts_json" > "$box/data/options.json"
 
     cat > "$box/meminfo" <<EOF
@@ -202,6 +211,45 @@ fi
     || { printf '  FAIL  migration path blocked startup\n'; FAIL=$((FAIL+1)); }
 rm -rf "$box"
 
+# ---------------------------------------------------------------------------
+printf -- '\n--- 12. cpu_priority=low: runs under nice + ionice ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"cpu_priority":"low"}' stub)"
+check    "announces low priority"  "CPU priority: low"       "$out"
+check    "wraps in nice"           "NICE_CALLED args:-n 19"  "$out"
+check    "wraps in ionice"         "IONICE_CALLED args:-c 3" "$out"
+check    "still reaches uvicorn"   "UVICORN_STARTED"         "$out"
+check    "still binds 8000"        "--port 8000"             "$out"
+check_rc "exits cleanly"           "0"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 13. cpu_priority=normal: no nice, even though it is available ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"cpu_priority":"normal"}' stub)"
+check        "announces normal"     "CPU priority: normal" "$out"
+check_absent "does not nice"        "NICE_CALLED"          "$out"
+check_absent "does not ionice"      "IONICE_CALLED"        "$out"
+check        "reaches uvicorn"      "UVICORN_STARTED"      "$out"
+check_rc     "exits cleanly"        "0"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 14. option absent: defaults to low, matching config.yaml ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}' stub)"
+check    "defaults to low"      "CPU priority: low"      "$out"
+check    "wraps in nice"        "NICE_CALLED args:-n 19" "$out"
+check_rc "exits cleanly"        "0"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 15. garbage cpu_priority: warns but must still start ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"cpu_priority":"turbo"}' stub)"
+check        "warns"            "unknown cpu_priority" "$out"
+check_absent "does not nice"    "NICE_CALLED"          "$out"
+check        "still starts"     "UVICORN_STARTED"      "$out"
+check_rc     "exits cleanly"    "0"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 16. cpu_priority=low but nice absent: degrades, does not crash ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"cpu_priority":"low"}')"
+check    "still reaches uvicorn" "UVICORN_STARTED" "$out"
+check_rc "exits cleanly"         "0"
 printf '\n================================================================\n'
 printf ' RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '================================================================\n\n'

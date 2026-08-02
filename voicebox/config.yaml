@@ -1,5 +1,5 @@
 name: Voicebox
-version: "0.1.0"
+version: "0.2.0"
 slug: voicebox
 description: >-
   Local AI voice studio — text-to-speech, voice cloning, transcription and an
@@ -57,6 +57,7 @@ options:
   min_free_ram_mb: 8192
   allow_low_ram_start: false
   cors_origins: ""
+  cpu_priority: low
 
 schema:
   log_level: list(debug|info|warning|error)
@@ -67,3 +68,7 @@ schema:
   # to a warning. Read DOCS.md before touching it.
   allow_low_ram_start: bool
   cors_origins: str?
+  # Frigate and friends are latency-critical; Voicebox inference is not.
+  # 'low' runs it under nice 19 so it yields whenever anything else wants the
+  # CPU. Only affects behaviour when the CPU is actually contended.
+  cpu_priority: list(low|normal)

@@ -60,6 +60,7 @@ LOG_LEVEL="$(get_opt log_level info)"
 MIN_FREE_RAM_MB="$(get_opt min_free_ram_mb 8192)"
 ALLOW_LOW_RAM="$(get_opt allow_low_ram_start false)"
 CORS_ORIGINS="$(get_opt cors_origins '')"
+CPU_PRIORITY="$(get_opt cpu_priority low)"
 
 # Guard against a non-numeric value reaching the arithmetic below.
 [[ "$MIN_FREE_RAM_MB" =~ ^[0-9]+$ ]] || MIN_FREE_RAM_MB=8192
@@ -181,10 +182,46 @@ log "first start downloads several GB of models; this takes a while"
 # ---------------------------------------------------------------------------
 # Start
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CPU priority
+# ---------------------------------------------------------------------------
+# Supervisor applies no CPU quota to add-ons either: the container-create call
+# in supervisor/docker/app.py sets cpu_rt_runtime, which is realtime scheduling
+# headroom, not a general limit. So just as with memory, any ceiling has to be
+# applied from in here.
+#
+# This matters when something latency-critical already owns most of the CPU --
+# Frigate running camera detection is the usual case. Voicebox inference is
+# CPU-bound, and at equal priority the two simply take turns. The visible
+# symptom is not slow speech, it is dropped frames on the NVR.
+#
+# nice costs nothing while the CPU is idle -- it only applies under contention,
+# which is exactly when it should. ionice -c 3 (idle) does the same for disk,
+# which matters while several GB of models are read in on first start.
+CMD=()
+case "$CPU_PRIORITY" in
+    low)
+        if command -v nice >/dev/null 2>&1; then
+            CMD+=(nice -n 19)
+            command -v ionice >/dev/null 2>&1 && CMD+=(ionice -c 3)
+            log "CPU priority: low - yields to other add-ons whenever they need the CPU"
+        else
+            warn "nice not found in image; starting at normal CPU priority"
+        fi
+        ;;
+    normal)
+        log "CPU priority: normal - competes equally with every other add-on"
+        ;;
+    *)
+        warn "unknown cpu_priority '$CPU_PRIORITY'; falling back to normal"
+        ;;
+esac
+
 # Port 8000 matches the published image and config.yaml's ports mapping.
 # exec so uvicorn becomes PID 1 and receives SIGTERM directly on stop.
 cd "$APP_ROOT"
-exec uvicorn backend.main:app \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --log-level "$LOG_LEVEL"
+CMD+=(uvicorn backend.main:app
+      --host 0.0.0.0
+      --port 8000
+      --log-level "$LOG_LEVEL")
+exec "${CMD[@]}"

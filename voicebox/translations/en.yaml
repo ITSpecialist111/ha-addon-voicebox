@@ -21,6 +21,13 @@ configuration:
       Optional comma-separated list of allowed browser origins for the API.
       Leave empty unless you are calling Voicebox from a web page hosted
       elsewhere.
+  cpu_priority:
+    name: CPU priority
+    description: >-
+      Low runs Voicebox under nice 19, so it gives way to other add-ons whenever
+      they need the CPU. Recommended when something latency-sensitive such as
+      Frigate shares the machine: voice generation gets slower under load rather
+      than the NVR dropping frames. Normal competes on equal terms.
 network:
   8000/tcp: >-
     Voicebox web UI, REST API and MCP endpoint. NOTE: Voicebox has no
