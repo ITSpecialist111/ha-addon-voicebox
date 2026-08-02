@@ -74,6 +74,13 @@ EOF
     printf '#!/usr/bin/env bash\necho "UVICORN_STARTED args:$*"\n' > "$box/bin/uvicorn"
     chmod +x "$box/bin/uvicorn"
 
+    # Optional hook so a scenario can damage the sandbox — remove meminfo,
+    # pre-place a broken symlink, make a directory unwritable — before run.sh
+    # sees it. "$box" is in scope. Cleared by the caller after use.
+    if [[ -n "${PREP_HOOK:-}" ]]; then
+        eval "$PREP_HOOK"
+    fi
+
     # The exit code has to travel out of the command substitution, which is a
     # subshell — a plain global assignment inside would be discarded. Write it
     # to a file in the caller's scope instead.
@@ -153,7 +160,8 @@ check_rc "exits cleanly"           "0"
 # ---------------------------------------------------------------------------
 printf -- '\n--- 8. min_free_ram_mb=0 disables the check ---\n'
 out="$(run_case 100 0 '{"min_free_ram_mb":0}')"
-check    "passes with only 100 MB" "RAM preflight passed" "$out"
+check        "reports the check is off" "RAM preflight disabled"  "$out"
+check_absent "does not claim it passed" "RAM preflight passed"   "$out"
 check    "still starts"            "UVICORN_STARTED"      "$out"
 check_rc "exits cleanly"           "0"
 
@@ -250,6 +258,71 @@ printf -- '\n--- 16. cpu_priority=low but nice absent: degrades, does not crash 
 out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"cpu_priority":"low"}')"
 check    "still reaches uvicorn" "UVICORN_STARTED" "$out"
 check_rc "exits cleanly"         "0"
+# ---------------------------------------------------------------------------
+# The next three cover failing CLOSED. Previously an unreadable or malformed
+# meminfo let the start proceed, which disabled the safeguard precisely when
+# something was already wrong. "Could not measure" is not "there is enough".
+printf -- '\n--- 17. meminfo missing: must refuse, not assume ---\n'
+PREP_HOOK='rm -f "$box/meminfo"'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+PREP_HOOK=''
+check        "refuses"              "REFUSING TO START"  "$out"
+check        "says why"             "unreadable"         "$out"
+check_absent "never reaches uvicorn" "UVICORN_STARTED"   "$out"
+check_rc     "exits non-zero"       "1"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 18. meminfo present but unparseable: must refuse ---\n'
+PREP_HOOK='printf "garbage\nnot a meminfo\n" > "$box/meminfo"'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+PREP_HOOK=''
+check        "refuses"              "REFUSING TO START"        "$out"
+check        "names the field"      "could not parse MemAvailable" "$out"
+check_absent "never reaches uvicorn" "UVICORN_STARTED"         "$out"
+check_rc     "exits non-zero"       "1"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 19. unmeasurable + override: proceeds, because that is the opt-out ---\n'
+PREP_HOOK='rm -f "$box/meminfo"'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"allow_low_ram_start":true}')"
+PREP_HOOK=''
+check        "warns rather than refusing" "starting anyway"   "$out"
+check_absent "does not refuse"            "REFUSING TO START" "$out"
+check        "reaches uvicorn"            "UVICORN_STARTED"   "$out"
+check_rc     "exits cleanly"              "0"
+
+# ---------------------------------------------------------------------------
+# A dangling symlink at /app/data looks fine to `[ -L ]` but every write
+# through it fails. Accepting one produced an add-on that reported healthy and
+# quietly lost data, so it has to be validated by target, not by type.
+printf -- '\n--- 20. broken symlink at /app/data: repaired, not trusted ---\n'
+if ln -s /tmp "$(mktemp -d)/probe" 2>/dev/null; then
+    PREP_HOOK='rm -rf "$box/app/data"; ln -s "$box/nonexistent-target" "$box/app/data"'
+    out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+    PREP_HOOK=''
+    check "notices and repairs it" "re-pointing" "$out"
+    check "still starts"           "UVICORN_STARTED" "$out"
+    check_rc "exits cleanly"       "0"
+else
+    printf '  SKIP  broken-symlink assertion — this filesystem has no symlink support\n'
+fi
+
+# ---------------------------------------------------------------------------
+# The migration used to mark itself done and delete the source even when the
+# copy had failed, which is unrecoverable. It must abort with the source intact.
+printf -- '\n--- 21. migration copy fails: aborts with the original intact ---\n'
+if [[ "$(id -u)" != "0" ]] && ln -s /tmp "$(mktemp -d)/probe2" 2>/dev/null; then
+    KEEP_BOX="$(mktemp -d)"
+    PREP_HOOK='echo precious > "$box/app/data/profile.db"; chmod 500 "$box/data"; echo "$box" > '"$KEEP_BOX"'/where'
+    out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+    PREP_HOOK=''
+    check        "does not claim success" "migrated" "$out"
+    check_absent "does not reach uvicorn" "UVICORN_STARTED" "$out"
+    rm -rf "$KEEP_BOX"
+else
+    printf '  SKIP  migration-failure assertion — running as root, or no symlink support\n'
+fi
+
 printf '\n================================================================\n'
 printf ' RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 printf '================================================================\n\n'

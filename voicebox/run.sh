@@ -75,11 +75,44 @@ CPU_PRIORITY="$(get_opt cpu_priority low)"
 #
 # Note this reads the HOST's memory. Containers without lxcfs see host values
 # in /proc/meminfo, which is what we want.
+# Fail CLOSED when memory cannot be established.
+#
+# This check is the only thing between an oversized start and the OOM killer,
+# and add-ons are killed first (oom_score_adj=200). "Could not measure" is not
+# evidence that there is enough; treating it as such would silently disable the
+# one safeguard here exactly when something is already wrong.
+# allow_low_ram_start remains the deliberate, documented override.
+cannot_determine() {
+    if [[ "$ALLOW_LOW_RAM" == "true" ]]; then
+        warn "$1 — starting anyway because allow_low_ram_start is enabled."
+        return 0
+    fi
+    warn "=========================================================="
+    warn "REFUSING TO START — $1"
+    warn ""
+    warn "  The RAM preflight could not be evaluated, so there is no"
+    warn "  evidence this will fit. Add-ons have no memory limit and are"
+    warn "  the kernel's first choice under pressure, so starting blind"
+    warn "  risks taking down other add-ons, not just this one."
+    warn ""
+    warn "  To start without the check:"
+    warn "    - set 'allow_low_ram_start: true'"
+    warn "    - or set 'min_free_ram_mb: 0' to disable it outright"
+    warn "=========================================================="
+    fail "RAM preflight could not be evaluated — see above."
+}
+
 ram_preflight() {
     local avail_kb avail_mb swap_free_kb swap_free_mb
 
+    # An explicit 0 means the user has switched the check off on purpose.
+    if (( MIN_FREE_RAM_MB == 0 )); then
+        log "RAM preflight disabled (min_free_ram_mb = 0)."
+        return 0
+    fi
+
     if [[ ! -r "$MEMINFO" ]]; then
-        warn "$MEMINFO unreadable — skipping the RAM preflight."
+        cannot_determine "$MEMINFO is unreadable"
         return 0
     fi
 
@@ -87,7 +120,7 @@ ram_preflight() {
     swap_free_kb="$(awk '/^SwapFree:/ {print $2; exit}' "$MEMINFO" || true)"
 
     if [[ ! "$avail_kb" =~ ^[0-9]+$ ]]; then
-        warn "could not parse MemAvailable — skipping the RAM preflight."
+        cannot_determine "could not parse MemAvailable from $MEMINFO"
         return 0
     fi
     [[ "$swap_free_kb" =~ ^[0-9]+$ ]] || swap_free_kb=0
@@ -164,11 +197,42 @@ mkdir -p "$DATA_ROOT/cache/huggingface" "$DATA_ROOT/generations" "$NUMBA_CACHE_D
 
 # Voicebox writes profiles and its database to /app/data. That is inside the
 # image and would be lost on update, so redirect it onto /data via a symlink.
-if [[ ! -L "$APP_ROOT/data" ]]; then
-    mkdir -p "$DATA_ROOT/app-data"
+mkdir -p "$DATA_ROOT/app-data"
+
+# An existing symlink is only good enough if it actually resolves to the
+# persistent directory. A broken link, or one left pointing somewhere else by an
+# earlier version, would let the add-on start and then fail every write - the
+# worst outcome, because it looks healthy while quietly losing profiles.
+link_ok=false
+if [[ -L "$APP_ROOT/data" ]]; then
+    current="$(readlink -f "$APP_ROOT/data" 2>/dev/null || true)"
+    expected="$(readlink -f "$DATA_ROOT/app-data" 2>/dev/null || true)"
+    if [[ -n "$current" && -n "$expected" && "$current" == "$expected" ]]; then
+        link_ok=true
+    else
+        warn "$APP_ROOT/data resolves to '${current:-<broken>}', expected '$expected' - recreating it"
+        rm -f "$APP_ROOT/data"
+    fi
+fi
+
+if [[ "$link_ok" != true ]]; then
     # Preserve anything the image shipped there, once.
-    if [[ -d "$APP_ROOT/data" && ! -e "$DATA_ROOT/app-data/.migrated" ]]; then
-        cp -an "$APP_ROOT/data/." "$DATA_ROOT/app-data/" 2>/dev/null || true
+    #
+    # This used to be `cp ... || true` followed unconditionally by `touch
+    # .migrated` and `rm -rf`. A copy that failed part way - out of space, bad
+    # permissions - was therefore recorded as migrated and the original deleted,
+    # losing profiles and the database silently. Now a failed copy aborts the
+    # start with the source still intact.
+    if [[ -d "$APP_ROOT/data" && ! -L "$APP_ROOT/data" && ! -e "$DATA_ROOT/app-data/.migrated" ]]; then
+        log "migrating existing $APP_ROOT/data into $DATA_ROOT/app-data"
+        if ! cp -an "$APP_ROOT/data/." "$DATA_ROOT/app-data/"; then
+            warn "=========================================================="
+            warn "Could not copy $APP_ROOT/data to $DATA_ROOT/app-data."
+            warn "NOTHING has been deleted - the original data is untouched."
+            warn "Check free space and permissions on $DATA_ROOT, then retry."
+            warn "=========================================================="
+            fail "persistence migration failed - refusing to start."
+        fi
         touch "$DATA_ROOT/app-data/.migrated"
     fi
     rm -rf "$APP_ROOT/data"
