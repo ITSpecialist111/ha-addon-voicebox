@@ -170,9 +170,30 @@ out-of-memory event here is not contained to Voicebox: add-ons carry
 `oom_score_adj=200`, so the kernel prefers them as victims, and the practical
 casualty is whatever else is large — usually Frigate.
 
+Turning this on also **raises the memory floor**. The 1.7B model peaked at
+8130 MB here, and the default `min_free_ram_mb` is 8192 MB — 62 MB of margin,
+which is a rounding error rather than headroom, since `MemAvailable` moves by
+more than that while a model is loading. So if you enable `allow_large_model`
+and leave `min_free_ram_mb` below 9600, the add-on raises it to 9600 for that
+start and says so. Set it explicitly above 9600 to take control back.
+
 The enforcement is not advisory. At build time the image is patched at the one
 function every model load passes through, and the build fails if that function
 has moved. See `enforce-model-policy.py`.
+
+Three things back it up, because a guard that can be bypassed is not a guard:
+
+- **The external-provider subsystem is refused too.** Voicebox can download and
+  run a TTS engine as a *separate process*; its client defaults to 1.7B and
+  reports the size to that process rather than loading it here — so the
+  in-process guard would never see it, and neither would this add-on's memory
+  accounting. `POST /providers/start` and `POST /providers/download` therefore
+  return HTTP 403 unless `allow_large_model` is on. Stopping, deleting and
+  listing providers are unaffected.
+- **The add-on refuses to start if the guard is missing.** Not a warning — it
+  re-runs the verifier at startup and exits. An unguarded image never runs.
+- **The upstream image is pinned by digest**, not by the mutable `latest` tag,
+  so upstream cannot change the code underneath the patch.
 
 ### `cpu_priority`
 

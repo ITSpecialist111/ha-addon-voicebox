@@ -3,5 +3,8 @@
 # No `build_from:` here on purpose. Supervisor 2026.04.0 stopped injecting
 # BUILD_FROM automatically, and this add-on wraps the upstream Voicebox image
 # rather than a Home Assistant base image, so the Dockerfile pins its own FROM.
+#
+# Pinned by digest rather than tag: `latest` is mutable and this add-on
+# patches the image's backend. See the long note at the top of the Dockerfile.
 args:
-  VOICEBOX_TAG: latest
+  VOICEBOX_DIGEST: sha256:6b2539dd44682daab1fe5658068e5c9906154e4c014ba8fdd938dffcc65ddbc1

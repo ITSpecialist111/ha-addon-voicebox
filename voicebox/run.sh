@@ -30,6 +30,8 @@ OPTIONS_FILE="${VOICEBOX_OPTIONS_FILE:-/data/options.json}"
 DATA_ROOT="${VOICEBOX_DATA_ROOT:-/data}"
 APP_ROOT="${VOICEBOX_APP_ROOT:-/app}"
 MEMINFO="${VOICEBOX_MEMINFO:-/proc/meminfo}"
+POLICY_RECEIPT="${VOICEBOX_POLICY_RECEIPT:-/app/.voicebox-model-policy.json}"
+POLICY_VERIFIER="${VOICEBOX_POLICY_VERIFIER:-/usr/local/bin/enforce-model-policy.py}"
 
 log()  { printf '[%s] %s\n'  "$(date -u '+%H:%M:%S')" "$*"; }
 warn() { printf '[%s] WARNING: %s\n' "$(date -u '+%H:%M:%S')" "$*" >&2; }
@@ -65,6 +67,26 @@ ALLOW_LARGE_MODEL="$(get_opt allow_large_model false)"
 
 # Guard against a non-numeric value reaching the arithmetic below.
 [[ "$MIN_FREE_RAM_MB" =~ ^[0-9]+$ ]] || MIN_FREE_RAM_MB=8192
+
+# Turning on allow_large_model without raising the RAM floor is a trap.
+#
+# The 1.7B model peaked at 8130 MB here. The default floor is 8192 MB — 62 MB
+# of margin, which is 0.8%. That is not headroom, it is a rounding error: the
+# preflight would pass and the load would still be OOM-killed, because
+# MemAvailable moves by more than 62 MB while the model is loading.
+#
+# So opting in to the large model also raises the floor. The user asked to be
+# ALLOWED to load it, not to be allowed to crash the box trying.
+LARGE_MODEL_FLOOR_MB=9600
+if [[ "$ALLOW_LARGE_MODEL" == "true" ]] && (( MIN_FREE_RAM_MB != 0 )) \
+   && (( MIN_FREE_RAM_MB < LARGE_MODEL_FLOOR_MB )); then
+    warn "allow_large_model is on, but min_free_ram_mb is only ${MIN_FREE_RAM_MB} MB."
+    warn "  The 1.7B model peaked at 8130 MB on this hardware, so that leaves"
+    warn "  $(( MIN_FREE_RAM_MB - 8130 )) MB of margin — the load would still be OOM-killed."
+    warn "  Raising the preflight floor to ${LARGE_MODEL_FLOOR_MB} MB for this start."
+    warn "  Set min_free_ram_mb explicitly above ${LARGE_MODEL_FLOOR_MB} to silence this."
+    MIN_FREE_RAM_MB="$LARGE_MODEL_FLOOR_MB"
+fi
 
 # ---------------------------------------------------------------------------
 # RAM preflight — the reason this wrapper exists
@@ -265,10 +287,35 @@ fi
 # in load_model_async, the single function every TTS load funnels through. An
 # over-large request now returns a clean HTTP 400 instead of inviting the OOM
 # killer. The guard reads the policy from the variable exported below.
-if [[ ! -r /app/.voicebox-model-policy.json ]]; then
-    warn "model policy receipt is missing — this image predates the 1.7B guard."
-    warn "  Rebuild the add-on. Until then, ALWAYS pass model_size=0.6B by hand:"
-    warn "  the 1.7B default needs ~8.1 GB here and will be OOM-killed."
+#
+# This check FAILS CLOSED. It previously only warned and carried on, which is
+# the wrong way round: the case it is meant to catch — an image whose guard is
+# missing or has been tampered with — is exactly the case where starting is
+# dangerous. A warning scrolls past in the log and the box gets OOM-killed
+# anyway. Refusing to start is visible, harmless and reversible.
+#
+# It re-runs the verifier rather than merely checking the receipt EXISTS,
+# because a stale or planted receipt is precisely what an existence check
+# cannot detect.
+if [[ ! -r "$POLICY_RECEIPT" ]]; then
+    warn "model policy receipt is missing — this image predates the 1.7B guard,"
+    warn "  or the build step that installs it did not run."
+    fail "refusing to start without the model guard: the 1.7B default needs
+  ~8.1 GB here and has been OOM-killed twice. Rebuild the add-on
+  (Settings → Add-ons → Voicebox → Rebuild)."
+fi
+
+if [[ -r "$POLICY_VERIFIER" ]]; then
+    if ! policy_out=$(python3 "$POLICY_VERIFIER" --verify 2>&1); then
+        warn "model policy verification FAILED:"
+        while IFS= read -r line; do warn "  $line"; done <<< "$policy_out"
+        fail "refusing to start: the 1.7B guard is not intact. The image may be
+  stale or partially patched. Rebuild the add-on."
+    fi
+    log "model policy verified — 1.7B cannot be loaded by accident"
+else
+    warn "model policy verifier is not present in this image."
+    fail "refusing to start without a verifiable model guard. Rebuild the add-on."
 fi
 
 if [[ "$ALLOW_LARGE_MODEL" == "true" ]]; then

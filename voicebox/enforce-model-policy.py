@@ -85,6 +85,57 @@ RECEIPT = "/app/.voicebox-model-policy.json"
 # clamp in the handler so no input can reach the 500 path at all.
 HISTORY_LIMIT_MAX = 1000
 
+
+# The guard on PyTorchTTSBackend.load_model_async covers every load that the
+# BUNDLED backend performs. It does not cover the external-provider subsystem,
+# which is a genuine second route to 1.7B:
+#
+#   main.py:1591            POST /providers/start   (unauthenticated)
+#   providers/__init__.py   starts an installed provider EXECUTABLE
+#                           and swaps the active provider for LocalProvider
+#   providers/local.py:28   LocalProvider._current_model_size = "1.7B"
+#   providers/local.py:118  its load_model_async only RECORDS the size
+#   providers/local.py:46   generate() posts that size to the external process
+#
+# So a started provider would run 1.7B in a SEPARATE process - outside the
+# guard, and outside any memory accounting this add-on can do. Guarding
+# LocalProvider is not sufficient either, because the external server has its
+# own default and its own loader.
+#
+# The provider download currently 404s, but a 404 is not a safety boundary: it
+# could be restored upstream at any time, and a binary may already be present.
+#
+# So under the restrictive policy the two WRITE endpoints are refused outright.
+# The read endpoints, /providers/stop and DELETE are left alone - they cannot
+# start anything.
+MAIN_POLICY_BLOCK = """
+# --- injected by the Voicebox add-on: external provider policy ---
+import os as _vb_os
+
+_VB_PROVIDER_REFUSAL = (
+    "Voicebox add-on: external TTS providers are disabled on this host. A "
+    "provider runs as a separate process that this add-on cannot bound, and "
+    "the bundled provider client defaults to the 1.7B model, which needs "
+    "about 8.1 GB of RAM and has been OOM-killed on this machine. Home "
+    "Assistant biases the kernel to kill add-ons first, so starting one also "
+    "risks other add-ons such as Frigate. Set allow_large_model: true in the "
+    "add-on configuration if this host really can spare the memory."
+)
+
+
+def _vb_external_providers_allowed():
+    raw = _vb_os.environ.get("VOICEBOX_ALLOWED_MODEL_SIZES", "0.6B")
+    return "1.7B" in [p.strip() for p in raw.split(",") if p.strip()]
+
+
+# --- end injected block ---
+"""
+
+PROVIDER_GUARD = [
+    "    if not _vb_external_providers_allowed():",
+    "        raise HTTPException(status_code=403, detail=_VB_PROVIDER_REFUSAL)",
+]
+
 # SHA-256 of each file as shipped in the image this add-on is built against
 # (ghcr.io/jamiepine/voicebox@sha256:b7e39a79...9532, amd64). Verified by
 # extracting the 72 KB layer that carries app/backend and hashing it directly.
@@ -150,7 +201,10 @@ def read(root, rel):
             "%s does not exist. The image layout has changed; re-verify the "
             "patch targets before shipping." % path
         )
-    with open(path, "r", encoding="utf-8") as fh:
+    # newline="" on both read and write: without it, Python translates on
+    # Windows and the patched file comes out CRLF while the container produces
+    # LF. That makes local runs non-reproducible against production bytes.
+    with open(path, "r", encoding="utf-8", newline="") as fh:
         return fh.read()
 
 
@@ -174,6 +228,53 @@ def insert_after(src, lineno, new_lines, what):
     if lineno < 1 or lineno > len(lines):
         raise PolicyError("%s: line %d out of range" % (what, lineno))
     return "\n".join(lines[:lineno] + new_lines + lines[lineno:])
+
+
+def extract_block(src, start_marker, end_marker, what):
+    """Pull an injected block back out of a patched file, verbatim.
+
+    Behavioural checks must run the code that will actually ship. Running this
+    script's own constant instead proves only that the constant is correct.
+    """
+    i = src.find(start_marker)
+    if i < 0:
+        raise PolicyError("%s: injected block start marker is missing" % what)
+    if src.find(start_marker, i + 1) >= 0:
+        raise PolicyError("%s: injected block start marker appears twice" % what)
+    j = src.find(end_marker, i)
+    if j < 0:
+        raise PolicyError("%s: injected block end marker is missing" % what)
+    return src[i:j]
+
+
+def is_docstring(node):
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
+def stmt_index(fn, pred):
+    """Index of the first top-level statement in fn whose subtree matches pred.
+
+    Used to assert ORDER. Checking only that a call exists somewhere in a
+    function is not enough: a guard placed after the load it is meant to
+    prevent would satisfy an existence check and prevent nothing.
+    """
+    for i, st in enumerate(fn.body):
+        for node in ast.walk(st):
+            if pred(node):
+                return i
+    return None
+
+
+def calls_named(name):
+    return lambda n: isinstance(n, ast.Call) and getattr(n.func, "id", None) == name
+
+
+def attr_named(name):
+    return lambda n: isinstance(n, ast.Attribute) and n.attr == name
 
 
 def find_class(tree, name, what):
@@ -296,28 +397,25 @@ def patch_models(src):
 def patch_main(src):
     tree = ast.parse(src)
 
-    # /models/load query-parameter default
-    loads = [
-        n for n in tree.body
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "load_model"
-    ]
-    if len(loads) != 1:
-        raise PolicyError(
-            "main.py: expected exactly one load_model route, found %d" % len(loads)
-        )
-    route = loads[0]
+    def sole(name):
+        fns = [
+            n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+        ]
+        if len(fns) != 1:
+            raise PolicyError(
+                "main.py: expected exactly one %s, found %d" % (name, len(fns))
+            )
+        return fns[0]
 
-    # /generate fallback
-    gens = [
-        n for n in tree.body
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "generate_speech"
-    ]
-    if len(gens) != 1:
-        raise PolicyError(
-            "main.py: expected exactly one generate_speech route, found %d" % len(gens)
-        )
+    route = sole("load_model")          # /models/load query-parameter default
+    gen = sole("generate_speech")       # /generate fallback
+    hist = sole("list_history")         # /history 500
+    start_p = sole("start_provider")    # /providers/start
+    down_p = sole("download_provider_endpoint")  # /providers/download
+
     fallbacks = [
-        n for n in ast.walk(gens[0])
+        n for n in ast.walk(gen)
         if isinstance(n, ast.Assign)
         and len(n.targets) == 1
         and getattr(n.targets[0], "id", None) == "model_size"
@@ -329,6 +427,31 @@ def patch_main(src):
             "generate_speech, found %d" % len(fallbacks)
         )
 
+    calls = [
+        n for n in ast.walk(hist)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "HistoryQuery"
+    ]
+    if len(calls) != 1:
+        raise PolicyError(
+            "main.py: expected exactly one models.HistoryQuery(...) in "
+            "list_history, found %d" % len(calls)
+        )
+
+    def sole_kw(call, arg):
+        kws = [k for k in call.keywords if k.arg == arg]
+        if len(kws) != 1:
+            raise PolicyError(
+                "main.py: expected exactly one %s= keyword in the HistoryQuery "
+                "call, found %d" % (arg, len(kws))
+            )
+        return kws[0]
+
+    kw_limit = sole_kw(calls[0], "limit")
+    kw_offset = sole_kw(calls[0], "offset")
+
+    # --- line replacements first: these do not shift any line numbers -----
     src = replace_line(
         src, fallbacks[0].lineno,
         '        model_size = data.model_size or "1.7B"',
@@ -341,39 +464,48 @@ def patch_main(src):
         'async def load_model(model_size: str = "0.6B"):',
         "main.py /models/load default",
     )
-
-    # --- upstream /history 500 (see HISTORY_LIMIT_MAX) ---
-    hists = [
-        n for n in tree.body
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "list_history"
-    ]
-    if len(hists) != 1:
-        raise PolicyError(
-            "main.py: expected exactly one list_history route, found %d" % len(hists)
-        )
-    calls = [
-        n for n in ast.walk(hists[0])
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "HistoryQuery"
-    ]
-    if len(calls) != 1:
-        raise PolicyError(
-            "main.py: expected exactly one models.HistoryQuery(...) in "
-            "list_history, found %d" % len(calls)
-        )
-    kws = [k for k in calls[0].keywords if k.arg == "limit"]
-    if len(kws) != 1:
-        raise PolicyError(
-            "main.py: expected exactly one limit= keyword in the HistoryQuery "
-            "call, found %d" % len(kws)
-        )
+    # Both HistoryQuery kwargs are clamped. offset was missed on the first
+    # pass: offset=-1 hits ge=0 and produces exactly the same 500 as limit did.
     src = replace_line(
-        src, kws[0].value.lineno,
+        src, kw_limit.value.lineno,
         "        limit=limit,",
-        "        limit=max(1, min(limit, %d)),  # vb: upstream 500s above the cap"
-        % HISTORY_LIMIT_MAX,
+        "        limit=max(1, min(limit, %d))," % HISTORY_LIMIT_MAX,
         "main.py /history limit clamp",
+    )
+    src = replace_line(
+        src, kw_offset.value.lineno,
+        "        offset=offset,",
+        "        offset=max(0, offset),",
+        "main.py /history offset clamp",
+    )
+
+    # --- insertions last, BOTTOM-UP, so earlier line numbers stay valid ---
+    body_start = lambda fn: (
+        fn.body[0].end_lineno
+        if isinstance(fn.body[0], ast.Expr)
+        and isinstance(fn.body[0].value, ast.Constant)
+        and isinstance(fn.body[0].value.value, str)
+        else fn.body[0].lineno - 1
+    )
+
+    guards = sorted(
+        [(body_start(down_p), "download_provider_endpoint"),
+         (body_start(start_p), "start_provider")],
+        reverse=True,
+    )
+    for lineno, what in guards:
+        src = insert_after(src, lineno, PROVIDER_GUARD, "main.py %s guard" % what)
+
+    # The helper block goes above everything, so it is inserted last.
+    imports = [
+        n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))
+    ]
+    if not imports:
+        raise PolicyError("main.py: no top-level imports found")
+    src = insert_after(
+        src, max(n.end_lineno for n in imports),
+        MAIN_POLICY_BLOCK.split("\n"),
+        "main.py policy block",
     )
     return src
 
@@ -387,6 +519,11 @@ PATCHERS = {
 
 def apply(root):
     if os.path.isfile(RECEIPT):
+        # Do not take the receipt's word for it. A stale or planted receipt
+        # would otherwise turn --apply into a silent no-op that reports
+        # success - which is exactly how the previous attempt failed.
+        print("receipt already present; verifying rather than trusting it")
+        return verify(root)
         print("model policy already applied (%s exists); nothing to do" % RECEIPT)
         return 0
 
@@ -422,7 +559,7 @@ def apply(root):
 
     # 4. only now write
     for rel, src in patched.items():
-        with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+        with open(os.path.join(root, rel), "w", encoding="utf-8", newline="") as fh:
             fh.write(src)
         print("patched %s" % rel)
 
@@ -455,8 +592,15 @@ def verify(root):
     checks = []
 
     # --- behavioural: the policy helpers actually refuse 1.7B ----------
+    # Exec the block AS IT SITS IN THE PATCHED FILE, not this script's own
+    # constant. Exec'ing the constant would only prove the patcher's source is
+    # correct - it would pass even if the deployed file had been neutered.
     ns = {}
-    exec(compile(POLICY_BLOCK, "policy", "exec"), ns)
+    exec(compile(extract_block(
+        read(root, "backends/pytorch_backend.py"),
+        "# --- Home Assistant add-on: model size policy",
+        "# --- end Home Assistant add-on policy",
+        "backends/pytorch_backend.py"), "policy", "exec"), ns)
     saved = os.environ.pop("VOICEBOX_ALLOWED_MODEL_SIZES", None)
     try:
         assert ns["_vb_default_model_size"]() == "0.6B", "default is not 0.6B"
@@ -493,16 +637,29 @@ def verify(root):
     tree = ast.parse(read(root, "backends/pytorch_backend.py"))
     cls = find_class(tree, "PyTorchTTSBackend", "pytorch_backend.py")
     loader = find_method(cls, "load_model_async", "pytorch_backend.py")
-    guarded = any(
-        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_vb_enforce_model_size"
-        for n in ast.walk(loader)
-    )
-    if not guarded:
+    g = stmt_index(loader, calls_named("_vb_enforce_model_size"))
+    if g is None:
         raise PolicyError(
             "PyTorchTTSBackend.load_model_async does not call "
             "_vb_enforce_model_size - the guard is not in the load path."
         )
-    checks.append("PyTorchTTSBackend.load_model_async is guarded")
+    # Existence is not enough. A guard that runs AFTER the load it is meant to
+    # prevent would satisfy an existence check and prevent nothing, so assert
+    # it precedes both the load and the unload.
+    for attr, why in (
+        ("_load_model_sync", "the model would already have been loaded"),
+        ("unload_model", "a refused request would still have unloaded the "
+                         "working model"),
+    ):
+        i = stmt_index(loader, attr_named(attr))
+        if i is not None and g >= i:
+            raise PolicyError(
+                "PyTorchTTSBackend.load_model_async calls _vb_enforce_model_size "
+                "at statement %d but %s at statement %d - %s."
+                % (g, attr, i, why)
+            )
+    checks.append(
+        "load_model_async guard precedes both _load_model_sync and unload_model")
 
     init = find_method(cls, "__init__", "pytorch_backend.py")
     if any(
@@ -540,16 +697,77 @@ def verify(root):
     ]
     if len(hists) != 1:
         raise PolicyError("main.py: list_history is no longer unique")
-    clamped = any(
-        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "min"
-        for n in ast.walk(hists[0])
-    )
-    if not clamped:
-        raise PolicyError(
-            "main.py: list_history does not clamp limit - an oversized limit "
-            "would still reach the 500 path."
-        )
-    checks.append("main.py /history clamps limit before building the query")
+    hq = [
+        n for n in ast.walk(hists[0])
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "HistoryQuery"
+    ]
+    if len(hq) != 1:
+        raise PolicyError("main.py: HistoryQuery call in list_history is no longer unique")
+    # Assert the EXACT clamp expression. "some min() appears somewhere" would
+    # be satisfied by an unrelated min() and prove nothing.
+    want = {
+        "limit": "max(1, min(limit, %d))" % HISTORY_LIMIT_MAX,
+        "offset": "max(0, offset)",
+    }
+    for arg, expected in want.items():
+        kws = [k for k in hq[0].keywords if k.arg == arg]
+        if len(kws) != 1:
+            raise PolicyError("main.py: HistoryQuery %s= is not unique" % arg)
+        got = ast.unparse(kws[0].value)
+        if got != expected:
+            raise PolicyError(
+                "main.py: HistoryQuery %s= is %r, expected %r - an out-of-range "
+                "value would still reach the 500 path." % (arg, got, expected)
+            )
+    checks.append("main.py /history clamps both limit and offset exactly")
+
+    # --- external providers are refused before they can start -------------
+    for fname, route in (
+        ("start_provider", "/providers/start"),
+        ("download_provider_endpoint", "/providers/download"),
+    ):
+        fns = [
+            n for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fname
+        ]
+        if len(fns) != 1:
+            raise PolicyError("main.py: %s is no longer unique" % fname)
+        i = stmt_index(fns[0], calls_named("_vb_external_providers_allowed"))
+        if i is None:
+            raise PolicyError(
+                "main.py: %s has no provider policy check. An external provider "
+                "runs 1.7B in a separate process, outside the backend guard."
+                % route
+            )
+        first = 1 if is_docstring(fns[0].body[0]) else 0
+        if i != first:
+            raise PolicyError(
+                "main.py: the %s policy check is at statement %d, expected %d "
+                "- work would happen before it." % (route, i, first)
+            )
+    checks.append("/providers/start and /providers/download refuse before doing work")
+
+    # behavioural: the provider helper honours the same env var
+    ns2 = {}
+    exec(compile(extract_block(
+        read(root, "main.py"),
+        "# --- injected by the Voicebox add-on: external provider policy ---",
+        "# --- end injected block ---",
+        "main.py"), "mainpolicy", "exec"), ns2)
+    saved = os.environ.pop("VOICEBOX_ALLOWED_MODEL_SIZES", None)
+    try:
+        if ns2["_vb_external_providers_allowed"]():
+            raise PolicyError("external providers are permitted by default")
+        os.environ["VOICEBOX_ALLOWED_MODEL_SIZES"] = "0.6B,1.7B"
+        if not ns2["_vb_external_providers_allowed"]():
+            raise PolicyError("allow_large_model did not re-enable providers")
+    finally:
+        os.environ.pop("VOICEBOX_ALLOWED_MODEL_SIZES", None)
+        if saved is not None:
+            os.environ["VOICEBOX_ALLOWED_MODEL_SIZES"] = saved
+    checks.append("external providers are refused by default, allowed only on opt-in")
 
     for line in checks:
         print("  OK  %s" % line)

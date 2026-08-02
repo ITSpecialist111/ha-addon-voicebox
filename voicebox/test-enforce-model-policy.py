@@ -14,6 +14,10 @@ Run against the real backend source extracted from the pinned image:
     python test-enforce-model-policy.py ../.imgsrc/app/backend
 """
 
+import ast
+import io
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -35,6 +39,16 @@ def check(ok, what, detail=""):
     else:
         FAIL += 1
         print("  FAIL %s %s" % (what, detail))
+
+
+# Exact text of the injected fragments, used by the mutation tests.
+GUARD_CALL = "        _vb_enforce_model_size(model_size)\n"
+LOAD_CALL = "        await asyncio.to_thread(self._load_model_sync, model_size)\n"
+UNLOAD_CALL = "            self.unload_model()\n"
+PROVIDER_GUARD_TXT = (
+    "    if not _vb_external_providers_allowed():\n"
+    "        raise HTTPException(status_code=403, detail=_VB_PROVIDER_REFUSAL)\n"
+)
 
 
 def run(root, mode, receipt):
@@ -84,6 +98,20 @@ class Sandbox:
         )
         self.write(rel, src.replace(old, new, count))
 
+    def reseal(self, rel):
+        """Refresh one 'after' hash in the receipt.
+
+        A mutation test that only tripped the hash gate would tell us nothing
+        about the semantic assertions, because the hash gate catches every
+        edit indiscriminately. Resealing forces the assertion to do the work.
+        """
+        with io.open(self.receipt, encoding="utf-8") as fh:
+            r = json.load(fh)
+        with io.open(self.path(rel), "rb") as fh:
+            r["after"][rel] = hashlib.sha256(fh.read()).hexdigest()
+        with io.open(self.receipt, "w", encoding="utf-8") as fh:
+            json.dump(r, fh, indent=2)
+
     def apply(self):
         return run(self.root, "--apply", self.receipt)
 
@@ -112,8 +140,8 @@ def main():
         check(v.returncode == 0, "verify succeeds after apply", v.stderr)
         check("GenerationRequest.model_size defaults to 0.6B" in v.stdout,
               "verify reports the GenerationRequest default")
-        check("load_model_async is guarded" in v.stdout,
-              "verify reports the loader guard")
+        check("load_model_async guard precedes" in v.stdout,
+              "verify reports that the loader guard is correctly ORDERED")
 
     # ---------------------------------------------------------------
     print("\n2. the patched result is sane Python")
@@ -151,14 +179,69 @@ def main():
               "Whisper loader is NOT guarded (its sizes are base/small/...)", r.stdout)
 
     # ---------------------------------------------------------------
-    print("\n4. the guard runs before anything is unloaded")
+    print("\n4. the guard runs before the load AND before the unload")
+    # This used to use src.index("_vb_enforce_model_size(model_size)"), which
+    # matched the function DEFINITION inside the injected block near the top of
+    # the file - always before everything, so the test passed no matter where
+    # the guard call actually sat. It proved nothing. Located via AST now.
     with Sandbox(source) as s:
         s.apply()
-        src = s.read("backends/pytorch_backend.py")
-        guard = src.index("_vb_enforce_model_size(model_size)")
-        unload = src.index("self.unload_model()")
-        check(guard < unload,
+        tree = ast.parse(s.read("backends/pytorch_backend.py"))
+        cls = [n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "PyTorchTTSBackend"]
+        check(len(cls) == 1, "PyTorchTTSBackend is unique")
+        fn = [n for n in cls[0].body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n.name == "load_model_async"]
+        check(len(fn) == 1, "load_model_async is unique within PyTorchTTSBackend")
+
+        def idx(pred):
+            for i, st in enumerate(fn[0].body):
+                if any(pred(n) for n in ast.walk(st)):
+                    return i
+            return None
+
+        g = idx(lambda n: isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) == "_vb_enforce_model_size")
+        ld = idx(lambda n: isinstance(n, ast.Attribute) and n.attr == "_load_model_sync")
+        ul = idx(lambda n: isinstance(n, ast.Attribute) and n.attr == "unload_model")
+        check(g is not None, "the guard CALL (not its definition) is in the loader body")
+        check(ld is not None and g < ld,
+              "guard precedes _load_model_sync, so a refusal allocates nothing")
+        check(ul is not None and g < ul,
               "guard precedes unload_model, so a refusal cannot drop a working model")
+
+    # ---------------------------------------------------------------
+    print("\n4b. MUTATION: a verifier that cannot fail is not a verifier")
+    # Each mutation refreshes the receipt hash, so the hash gate cannot be what
+    # fails - these test the SEMANTIC assertions.
+    mutations = (
+        ("guard moved after _load_model_sync", "backends/pytorch_backend.py",
+         lambda t: t.replace(GUARD_CALL, "").replace(LOAD_CALL, LOAD_CALL + GUARD_CALL, 1)),
+        ("guard moved after unload_model", "backends/pytorch_backend.py",
+         lambda t: t.replace(GUARD_CALL, "").replace(UNLOAD_CALL, UNLOAD_CALL + GUARD_CALL)),
+        ("one provider guard deleted", "main.py",
+         lambda t: t.replace(PROVIDER_GUARD_TXT, "", 1)),
+        ("offset clamp reverted", "main.py",
+         lambda t: t.replace("offset=max(0, offset),", "offset=offset,")),
+        ("limit clamp weakened", "main.py",
+         lambda t: t.replace("limit=max(1, min(limit, 1000)),", "limit=min(limit, 99999),")),
+        ("policy helper neutered", "backends/pytorch_backend.py",
+         lambda t: t.replace("    if model_size in allowed:\n        return model_size\n",
+                             "    return model_size\n")),
+    )
+    for label, rel, mutate in mutations:
+        with Sandbox(source) as s:
+            s.apply()
+            before = s.read(rel)
+            after = mutate(before)
+            check(after != before, "mutation '%s' actually changed the file" % label)
+            s.write(rel, after)
+            s.reseal(rel)
+            v = s.verify()
+            check(v.returncode != 0,
+                  "verify REJECTS: %s" % label,
+                  (v.stdout + v.stderr).strip()[-160:])
 
     # ---------------------------------------------------------------
     print("\n5. MOVED TARGET: upstream changes a file")
@@ -226,7 +309,7 @@ def main():
         first = s.read("backends/pytorch_backend.py")
         a = s.apply()
         check(a.returncode == 0, "second apply succeeds")
-        check("already applied" in a.stdout, "  ...and says it did nothing")
+        check("verifying rather than trusting it" in a.stdout, "  ...and says it did nothing")
         check(s.read("backends/pytorch_backend.py") == first,
               "  ...and changed nothing")
 
@@ -368,7 +451,8 @@ def main():
         check(v.returncode == 0, "verify passes with the history fix applied", v.stderr)
         check("HistoryQuery accepts limit=1000" in v.stdout,
               "verify reports the history cap")
-        check("clamps limit" in v.stdout, "verify reports the clamp")
+        check("clamps both limit and offset" in v.stdout,
+              "verify reports both clamps")
 
     # ---------------------------------------------------------------
     print("\n%d passed, %d failed" % (PASS, FAIL))

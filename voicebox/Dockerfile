@@ -19,14 +19,30 @@
 # image ships a TTS engine it cannot import and a web UI that only works if the
 # browser is on the same machine as the server. Both are repaired here, at
 # build time, so a failure is a failed build rather than a broken add-on.
-ARG VOICEBOX_TAG=latest
-FROM ghcr.io/jamiepine/voicebox:${VOICEBOX_TAG}
+#
+# PINNED BY DIGEST, not by tag. `:latest` is mutable: upstream can move it at
+# any time, and this add-on rewrites three of that image's backend files. The
+# patcher hash-gates those three, so a change there fails the build loudly —
+# but a change ELSEWHERE (a new loader, a change under providers/) would slip
+# through silently. Pinning removes that whole class of surprise, and makes a
+# build reproducible instead of "whatever :latest was that day".
+#
+# This is the multi-arch INDEX digest, so it still resolves per-architecture:
+#   linux/amd64  sha256:b7e39a7950a4dec7c93740df453f0bf58dd940352b83bac3b4ab634d7a930532
+#   linux/arm64  sha256:9eb7e9043a51687916ae19138b6e7609748ce0009f14f6ca1645b24a1a0fb912
+#
+# To take a newer upstream image: update the digest here AND in build.yaml,
+# re-extract the backend files, and refresh EXPECTED_BEFORE in
+# enforce-model-policy.py. The build will refuse until all three agree — which
+# is the point: it forces the patch to be re-checked against the new source.
+ARG VOICEBOX_DIGEST=sha256:6b2539dd44682daab1fe5658068e5c9906154e4c014ba8fdd938dffcc65ddbc1
+FROM ghcr.io/jamiepine/voicebox@${VOICEBOX_DIGEST}
 
 # Supervisor 2026.04.0 removed the implicit BUILD_FROM, so the FROM above is
 # explicit by necessity as well as by preference.
 
 ARG BUILD_ARCH=amd64
-ARG BUILD_VERSION=0.6.1
+ARG BUILD_VERSION=0.7.0
 
 # tini gives correct signal forwarding and zombie reaping, so uvicorn actually
 # receives SIGTERM when Home Assistant stops the add-on.

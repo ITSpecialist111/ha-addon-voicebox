@@ -74,6 +74,12 @@ EOF
     printf '#!/usr/bin/env bash\necho "UVICORN_STARTED args:$*"\n' > "$box/bin/uvicorn"
     chmod +x "$box/bin/uvicorn"
 
+    # The model-policy gate fails CLOSED, so a sandbox with no receipt would
+    # never reach uvicorn. Satisfy it by default; the scenarios that test the
+    # gate itself remove these again via PREP_HOOK.
+    printf '{"stub":true}\n' > "$box/app/.voicebox-model-policy.json"
+    printf 'import sys\nsys.exit(0)\n' > "$box/bin/policy-verifier.py"
+
     # Optional hook so a scenario can damage the sandbox — remove meminfo,
     # pre-place a broken symlink, make a directory unwritable — before run.sh
     # sees it. "$box" is in scope. Cleared by the caller after use.
@@ -91,6 +97,8 @@ EOF
         VOICEBOX_DATA_ROOT="$box/data" \
         VOICEBOX_APP_ROOT="$box/app" \
         VOICEBOX_MEMINFO="$box/meminfo" \
+        VOICEBOX_POLICY_RECEIPT="$box/app/.voicebox-model-policy.json" \
+        VOICEBOX_POLICY_VERIFIER="$box/bin/policy-verifier.py" \
         bash "$RUN_SH" 2>&1
         printf '%s' "$?" > "$RC_FILE"
     )"
@@ -135,6 +143,74 @@ check        "still refuses"          "REFUSING TO START"             "$out"
 check        "warns about thrashing"  "thrashing rather than working" "$out"
 check_absent "never reaches uvicorn"  "UVICORN_STARTED"               "$out"
 check_rc     "exits non-zero"         "1"
+
+# ---------------------------------------------------------------------------
+# The model-policy gate. This exists because the 1.7B model needs ~8.1 GB and
+# was OOM-killed twice on this box; the guard that prevents it is applied at
+# BUILD time, so run.sh must confirm the guard is actually present in the image
+# it has been handed. It used to only warn and carry on, which is the wrong way
+# round: the case it catches is precisely the case where starting is unsafe.
+printf -- '\n--- 4b. model policy receipt MISSING: must refuse ---\n'
+PREP_HOOK='rm -f "$box/app/.voicebox-model-policy.json"'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+PREP_HOOK=
+check        "gets past the RAM preflight"  "RAM preflight passed"    "$out"
+check        "refuses without the guard"    "refusing to start"       "$out"
+check        "says why"                     "predates the 1.7B guard" "$out"
+check_absent "never reaches uvicorn"        "UVICORN_STARTED"         "$out"
+check_rc     "exits non-zero"               "1"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 4c. verifier REJECTS the image: must refuse ---\n'
+# A receipt that exists but does not describe the image on disk is the exact
+# failure a mere existence check cannot see, so the verifier is re-run here.
+PREP_HOOK='printf "import sys\nsys.exit(1)\n" > "$box/bin/policy-verifier.py"'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+PREP_HOOK=
+check        "refuses on a failed verify" "guard is not intact" "$out"
+check_absent "never reaches uvicorn"      "UVICORN_STARTED"     "$out"
+check_rc     "exits non-zero"             "1"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 4d. verifier ABSENT from the image: must refuse ---\n'
+PREP_HOOK='rm -f "$box/bin/policy-verifier.py"'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+PREP_HOOK=
+check        "refuses without a verifier" "verifiable model guard" "$out"
+check_absent "never reaches uvicorn"      "UVICORN_STARTED"        "$out"
+check_rc     "exits non-zero"             "1"
+
+# ---------------------------------------------------------------------------
+printf -- '\n--- 4e. guard intact: says so, and starts ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
+check    "confirms the guard"   "model policy verified" "$out"
+check    "states the effect"    "cannot be loaded by accident" "$out"
+check    "starts"               "UVICORN_STARTED"       "$out"
+check_rc "exits cleanly"        "0"
+
+# ---------------------------------------------------------------------------
+# allow_large_model without a raised floor is a trap: 1.7B peaked at 8130 MB,
+# so the default 8192 MB floor leaves 62 MB of margin - a rounding error, not
+# headroom. Opting in must therefore also raise the floor.
+printf -- '\n--- 4f. allow_large_model raises the RAM floor ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"allow_large_model":true}')"
+check "notices the floor is too low" "min_free_ram_mb is only 8192 MB" "$out"
+check "quotes the real margin"       "62 MB of margin"                 "$out"
+check "raises it"                    "need 9600 MB"                    "$out"
+check "still starts with 12000 MB"   "UVICORN_STARTED"                 "$out"
+
+printf -- '\n--- 4g. allow_large_model + too little RAM: refuses at the NEW floor ---\n'
+out="$(run_case 9000 4096 '{"min_free_ram_mb":8192,"allow_large_model":true}')"
+check        "would have passed the old floor" "need 9600 MB"     "$out"
+check        "refuses at the raised floor"     "REFUSING TO START" "$out"
+check_absent "never reaches uvicorn"           "UVICORN_STARTED"   "$out"
+check_rc     "exits non-zero"                  "1"
+
+printf -- '\n--- 4h. explicit high floor is respected, not overridden ---\n'
+out="$(run_case 12000 4096 '{"min_free_ram_mb":11000,"allow_large_model":true}')"
+check_absent "does not warn"        "min_free_ram_mb is only" "$out"
+check        "keeps the user value" "need 11000 MB"           "$out"
+check        "starts"               "UVICORN_STARTED"         "$out"
 
 # ---------------------------------------------------------------------------
 printf -- '\n--- 5. malformed options.json: defaults, no crash-loop ---\n'
@@ -196,9 +272,13 @@ echo '{"min_free_ram_mb":0}' > "$box/data/options.json"
 echo 'pre-existing profile' > "$box/app/data/profiles.db"
 printf 'MemAvailable:   12582912 kB\nSwapFree:        4194300 kB\n' > "$box/meminfo"
 printf '#!/usr/bin/env bash\necho UVICORN_STARTED\n' > "$box/bin/uvicorn"; chmod +x "$box/bin/uvicorn"
+printf '{"stub":true}\n' > "$box/app/.voicebox-model-policy.json"
+printf 'import sys\nsys.exit(0)\n' > "$box/bin/policy-verifier.py"
 out="$(PATH="$box/bin:$PATH" VOICEBOX_OPTIONS_FILE="$box/data/options.json" \
      VOICEBOX_DATA_ROOT="$box/data" VOICEBOX_APP_ROOT="$box/app" \
-     VOICEBOX_MEMINFO="$box/meminfo" bash "$RUN_SH" 2>&1)"
+     VOICEBOX_MEMINFO="$box/meminfo" \
+     VOICEBOX_POLICY_RECEIPT="$box/app/.voicebox-model-policy.json" \
+     VOICEBOX_POLICY_VERIFIER="$box/bin/policy-verifier.py" bash "$RUN_SH" 2>&1)"
 
 if (( SYMLINKS_WORK )); then
     [[ -L "$box/app/data" ]] \

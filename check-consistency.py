@@ -78,6 +78,27 @@ report("image" not in cfg,
 # Supervisor normally injects BUILD_VERSION, but the Dockerfile default is what
 # lands in the image label if anything builds it directly. Silent drift here
 # produces an image that misreports its own version.
+# The upstream image is pinned by digest in TWO places: the Dockerfile ARG
+# default and build.yaml, which is what Supervisor actually passes. If they
+# drift, a build silently uses a different upstream image from the one the
+# patcher's hashes were computed against - and the failure would surface as a
+# confusing hash mismatch rather than as the drift it is.
+df_digest = re.search(r"ARG VOICEBOX_DIGEST=(sha256:[0-9a-f]{64})", dockerfile)
+by_path = pathlib.Path("voicebox/build.yaml")
+by_digest = None
+if by_path.is_file():
+    by = yaml.safe_load(by_path.read_text(encoding="utf-8")) or {}
+    by_digest = (by.get("args") or {}).get("VOICEBOX_DIGEST")
+report(bool(df_digest), "Dockerfile pins the upstream image by digest",
+       "Dockerfile has no ARG VOICEBOX_DIGEST=sha256:... - `latest` is mutable "
+       "and this add-on patches the image's backend")
+report(bool(by_digest), "build.yaml pins the upstream image by digest",
+       "build.yaml has no args.VOICEBOX_DIGEST")
+report(bool(df_digest) and by_digest == df_digest.group(1),
+       "Dockerfile and build.yaml pin the SAME digest",
+       f"build.yaml {by_digest} != Dockerfile "
+       f"{df_digest.group(1) if df_digest else 'missing'}")
+
 bv = re.search(r"ARG BUILD_VERSION=([^\s]+)", dockerfile)
 report(bool(bv) and bv.group(1) == str(cfg["version"]),
        f"Dockerfile BUILD_VERSION matches config.yaml ({cfg['version']})",
