@@ -167,13 +167,32 @@ you need it.
 - **Direct:** `http://<your-ha-ip>:17493`
 
 Ingress is enabled because Voicebox has **no authentication of its own**, and
-ingress puts HA's login in front of it. However, Voicebox serves a single-page
-app, and single-page apps sometimes emit absolute asset paths that do not
-survive being served under an ingress sub-path.
+ingress puts HA's login in front of it.
 
-**If the sidebar panel renders blank or the UI misbehaves, use the direct port
-instead.** That is why the port is still published. This particular combination
-has not been verified against a running instance.
+### The upstream UI is patched, because unpatched it cannot work here
+
+The frontend in the published image is built for a **desktop app**, and it shows
+in two ways. Both are fixed at build time by `patch-frontend.py`.
+
+1. **Every API call went to a hardcoded `http://127.0.0.1:17493`.** In a desktop
+   app that is correct — server and browser are the same machine. Served over a
+   network it is not: `127.0.0.1` resolves to *the machine running the browser*,
+   so the UI tries to talk to a Voicebox on your laptop. This broke the direct
+   port too, not just ingress, for every browser except one running on the Home
+   Assistant host itself.
+
+2. **`index.html` referenced its assets with absolute paths** (`/assets/...`).
+   Under ingress the app is served from a sub-path, so those requests hit Home
+   Assistant's own root and 404 — producing a blank panel.
+
+The patch makes the asset paths relative and replaces the hardcoded origin with
+a base URL derived from `location.pathname` at load time. Under ingress that
+yields the ingress prefix; anywhere else it yields the empty string, meaning
+same-origin. One patch, both routes fixed.
+
+It verifies itself during the build. If a future upstream image changes shape so
+that the patch no longer applies, **the build fails** rather than quietly
+shipping a blank page.
 
 ## Security
 
@@ -303,10 +322,38 @@ named there is also possible, and is the more dangerous outcome.
 Expected. It is downloading several GB of models. Watch the log. Subsequent
 starts are much faster because the cache is on the persistent volume.
 
-### Sidebar panel is blank
+Note that the **build** is also slow, and is CPU-heavy. On a machine that is
+already busy — an OptiPlex also running Frigate, for instance — schedule the
+build for a quiet period. The failure mode of building during peak load is not a
+failed build, it is your NVR dropping frames while it runs.
 
-Likely the ingress sub-path issue described under **Access**. Use
-`http://<your-ha-ip>:17493` directly.
+### Sidebar panel is blank, or the UI loads but nothing works
+
+This was the unpatched upstream behaviour — see **Access** above. It is fixed at
+build time, so if you are seeing it now, the most likely cause is that the patch
+did not run: check the add-on build log for `patch-frontend.py` and for the line
+confirming how many files it rewrote.
+
+A quick way to tell the two failure modes apart in the browser console:
+
+- **Blank panel, 404s for `/assets/...`** — the asset paths are still absolute.
+- **Panel renders but every action fails, with connection errors to
+  `127.0.0.1:17493`** — the hardcoded origin is still in the bundle.
+
+Rebuilding the add-on re-applies the patch.
+
+### Voice generation fails with `No module named 'qwen_tts'`
+
+That is the published upstream image, which ships **without a TTS engine** —
+downloading a voice model appears to work and then errors. The in-app provider
+installer cannot repair it either: it fetches from `downloads.voicebox.sh`,
+which returns 404, and `/providers/start` rejects provider types that
+`/providers` itself lists as installed.
+
+This add-on installs the engine during the build, so a freshly built add-on
+should not show this. If it does, the build did not complete — check the log for
+the `import qwen_tts` smoke test, which runs at build time precisely so this
+fails loudly at build rather than quietly at first use.
 
 ### Out of disk space
 

@@ -1,9 +1,9 @@
 name: Voicebox
-version: "0.2.0"
+version: "0.3.0"
 slug: voicebox
 description: >-
-  Local AI voice studio — text-to-speech, voice cloning, transcription and an
-  MCP server. Runs entirely on your own hardware.
+  Local AI voice studio — text-to-speech, voice cloning and transcription.
+  Runs entirely on your own hardware.
 url: https://github.com/ITSpecialist111/ha-addon-voicebox
 arch:
   - amd64
@@ -25,16 +25,22 @@ ports:
   8000/tcp: 17493
 ports_description:
   8000/tcp: >-
-    Voicebox web UI, REST API and MCP endpoint. Published on host port 17493 by
-    default. The API has NO authentication — only expose on a trusted LAN.
+    Voicebox web UI and REST API. Published on host port 17493 by default.
+    The API has NO authentication of any kind — including an unauthenticated
+    POST /shutdown — so only expose it on a trusted LAN. Prefer the ingress
+    panel, which puts Home Assistant's own login in front of it.
 
 webui: "http://[HOST]:[PORT:8000]/"
 
 # Ingress puts the UI behind Home Assistant's own authentication, which matters
-# because Voicebox itself has none. Left enabled, but the direct port above is
-# kept as a fallback: Voicebox serves a single-page app and if it emits
-# absolute asset paths it will not survive being served under an ingress
-# sub-path. If the ingress panel renders blank, use the direct port instead.
+# because Voicebox itself has none.
+#
+# The shipped single-page app does not survive this unaided. It is a desktop-app
+# build: it references its assets with absolute paths, and every API call goes to
+# a hardcoded http://127.0.0.1:17493. Unpatched it renders blank under ingress
+# AND calls the wrong machine over the direct port. patch-frontend.py rewrites
+# both at build time so the UI works either way. The direct port stays as a
+# fallback.
 ingress: true
 ingress_port: 8000
 panel_icon: mdi:account-voice

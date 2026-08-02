@@ -7,8 +7,10 @@ configuration:
     name: Minimum free RAM (MB)
     description: >-
       Refuse to start unless at least this much memory is actually available.
-      Default 8192, the minimum Voicebox states for a single engine. Set to 0 to
-      disable the check. Raise to 16384 if you run multiple engines at once.
+      Default 8192, the minimum Voicebox states for a single engine. That figure
+      is a peak-during-inference one, not a resident one — measured idle usage is
+      around 600 MB — so 6000 is often a workable value on a 16 GB machine. Set
+      to 0 to disable the check entirely.
   allow_low_ram_start:
     name: Allow start with insufficient RAM
     description: >-
@@ -30,5 +32,6 @@ configuration:
       than the NVR dropping frames. Normal competes on equal terms.
 network:
   8000/tcp: >-
-    Voicebox web UI, REST API and MCP endpoint. NOTE: Voicebox has no
-    authentication of its own — only publish this on a trusted network.
+    Voicebox web UI and REST API. NOTE: Voicebox has no authentication of its
+    own, and anyone who can reach this port can stop the service, so only
+    publish it on a trusted network. The ingress panel is the safer route.
