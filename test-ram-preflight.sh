@@ -313,11 +313,21 @@ fi
 printf -- '\n--- 21. migration copy fails: aborts with the original intact ---\n'
 if [[ "$(id -u)" != "0" ]] && ln -s /tmp "$(mktemp -d)/probe2" 2>/dev/null; then
     KEEP_BOX="$(mktemp -d)"
-    PREP_HOOK='echo precious > "$box/app/data/profile.db"; chmod 500 "$box/data"; echo "$box" > '"$KEEP_BOX"'/where'
+    # The copy itself must be what fails. Making $box/data unwritable would
+    # abort the earlier cache mkdir instead, and never reach the migration.
+    PREP_HOOK='echo precious > "$box/app/data/profile.db"; chmod 000 "$box/app/data/profile.db"; echo "$box" > '"$KEEP_BOX"'/where'
     out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
     PREP_HOOK=''
-    check        "does not claim success" "migrated" "$out"
-    check_absent "does not reach uvicorn" "UVICORN_STARTED" "$out"
+    box_path="$(cat "$KEEP_BOX/where" 2>/dev/null || true)"
+    chmod 600 "$box_path/app/data/profile.db" 2>/dev/null || true
+    state=""
+    [[ -f "$box_path/app/data/profile.db" ]]      && state+="SOURCE_INTACT "
+    [[ -e "$box_path/data/app-data/.migrated" ]]  && state+="MARKED_MIGRATED "
+    check        "refuses to start"              "persistence migration failed" "$out"
+    check        "says nothing was deleted"      "NOTHING has been deleted"     "$out"
+    check_absent "does not reach uvicorn"        "UVICORN_STARTED"              "$out"
+    check        "leaves the original in place"  "SOURCE_INTACT"                "$state"
+    check_absent "does not mark itself migrated" "MARKED_MIGRATED"              "$state"
     rm -rf "$KEEP_BOX"
 else
     printf '  SKIP  migration-failure assertion — running as root, or no symlink support\n'

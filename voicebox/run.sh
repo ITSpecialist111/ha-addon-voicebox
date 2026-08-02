@@ -168,7 +168,7 @@ ram_preflight() {
     warn ""
     warn "  Options, best first:"
     warn "    - run Voicebox on a machine with more RAM and point Home"
-    warn "      Assistant at it over REST/MCP instead"
+    warn "      Assistant at its REST API instead"
     warn "    - stop other add-ons to free memory, then retry"
     warn "    - lower 'min_free_ram_mb' if you believe your workload needs"
     warn "      less than the 8 GB upstream states"

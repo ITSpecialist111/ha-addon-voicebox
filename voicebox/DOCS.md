@@ -1,7 +1,7 @@
 # Voicebox
 
-Local AI voice studio for Home Assistant — text-to-speech, voice cloning,
-transcription, and an MCP server, running entirely on your own hardware.
+Local AI voice studio for Home Assistant — text-to-speech, voice cloning
+and transcription, running entirely on your own hardware.
 
 ## Read this first: will it fit?
 
@@ -240,8 +240,8 @@ there. **Your profiles survive add-on updates.**
 ## Using it from Home Assistant
 
 Voicebox is not a Wyoming service, so it will **not** appear as a TTS engine in
-an Assist pipeline. It is a REST/MCP service. Use it via `rest_command`, or
-point an MCP-capable agent at the `/mcp` endpoint.
+an Assist pipeline. It is a REST service — the published image has no `/mcp`
+endpoint, see below — so drive it with `rest_command`.
 
 A minimal example:
 
@@ -282,7 +282,7 @@ memory while leaving the service up.
 
 Upstream documents an MCP endpoint at `/mcp` over Streamable HTTP. **The image
 this add-on builds on does not implement it.** Verified against the running
-container''s own `/openapi.json`: 50+ routes are present and `/mcp` is not among
+container's own `/openapi.json`: 50+ routes are present and `/mcp` is not among
 them. `GET /mcp` returns 404.
 
 The published `:latest` tag was built 2026-02-03 and has not moved since, so MCP

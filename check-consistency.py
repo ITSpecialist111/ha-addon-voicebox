@@ -89,20 +89,38 @@ print()
 # container's own /openapi.json. Claiming otherwise sends users and agents at a
 # route that 404s, so keep the claim out of anything user-facing.
 mcp_ok = True
+# DOCS.md and run.sh are as user-facing as the rest: one is the add-on's
+# documentation tab, the other prints advice into the log when a start fails.
 for rel in ("voicebox/config.yaml", "voicebox/translations/en.yaml",
-            "README.md", "voicebox/README.md"):
+            "README.md", "voicebox/README.md",
+            "voicebox/DOCS.md", "voicebox/run.sh"):
     path = pathlib.Path(rel)
     if not path.is_file():
         continue
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    # A correct caveat often spans several lines - the mention lands on one and
+    # the negation on the next. Judging line by line flagged our own accurate
+    # warning, so qualify each mention against its whole paragraph.
+    para_of = {}
+    start = 0
+    for i, line in enumerate(lines + [""]):
+        if not line.strip():
+            for j in range(start, i):
+                para_of[j] = " ".join(lines[start:i])
+            start = i + 1
+
+    for lineno, line in enumerate(lines, 1):
         # Strip code formatting so `/mcp` and /mcp read the same.
         low = line.lower().replace("`", "").replace("*", "")
         if "mcp" not in low:
             continue
         # A caveat that says it is absent is exactly what we want to keep.
-        if any(k in low for k in ("not available", "no /mcp", "does not", "no mcp",
-                                  "absent", "postdates", "once upstream", "404",
-                                  "none of", "not yet", "no longer", "there is no")):
+        context = para_of.get(lineno - 1, line).lower().replace("`", "").replace("*", "")
+        if any(k in context for k in ("not available", "no /mcp", "does not", "no mcp",
+                                      "absent", "postdate", "once upstream", "404",
+                                      "none of", "not yet", "no longer", "there is no",
+                                      "not implement", "not among")):
             continue
         report(False, "", f"{rel}:{lineno} still advertises MCP: {line.strip()}")
         mcp_ok = False

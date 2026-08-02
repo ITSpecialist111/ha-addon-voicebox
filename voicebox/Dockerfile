@@ -26,7 +26,7 @@ FROM ghcr.io/jamiepine/voicebox:${VOICEBOX_TAG}
 # explicit by necessity as well as by preference.
 
 ARG BUILD_ARCH=amd64
-ARG BUILD_VERSION=0.3.1
+ARG BUILD_VERSION=0.4.0
 
 # tini gives correct signal forwarding and zombie reaping, so uvicorn actually
 # receives SIGTERM when Home Assistant stops the add-on.
@@ -161,6 +161,34 @@ RUN set -eux; \
 # silently shipping a blank page.
 COPY patch-frontend.py /usr/local/bin/patch-frontend.py
 RUN python3 /usr/local/bin/patch-frontend.py /app
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+# The CPU model-load path is written to be as memory-hungry as it is possible
+# to be: float32 weights AND low_cpu_mem_usage=False, which makes transformers
+# hold a randomly-initialised model and the checkpoint in RAM simultaneously.
+#
+# Measured on the target machine, loading the 0.6B model that way reached
+# 8127 MB resident and was killed by the kernel:
+#
+#     Out of memory: Killed process 2148335 (uvicorn)
+#       total-vm:16218332kB, anon-rss:8322080kB
+#
+# That is where the "8 GB minimum" comes from. It is a property of this
+# loading strategy, not of the model, and it is avoidable.
+#
+# patch-backend.py sets low_cpu_mem_usage=True on CPU model loads only,
+# leaving dtype and the accelerator path alone. It parses the source rather
+# than pattern-matching it, verifies the result, and fails the build if the
+# calls are no longer where it expects them.
+COPY patch-backend.py /usr/local/bin/patch-backend.py
+RUN python3 /usr/local/bin/patch-backend.py --dir /app/backend/backends; \
+    python3 /usr/local/bin/patch-backend.py --dir /app/backend/backends --check; \
+    cd /tmp && python3 -c "import sys; sys.path.insert(0, '/app'); \
+import backend.backends.qwen_custom_voice_backend, backend.backends.qwen_llm_backend; \
+print('patched backends import OK')"; \
+    rm -rf /tmp/data
 
 COPY run.sh /run.sh
 RUN chmod +x /run.sh && sed -i 's/\r$//' /run.sh
