@@ -102,6 +102,16 @@ EOF
         bash "$RUN_SH" 2>&1
         printf '%s' "$?" > "$RC_FILE"
     )"
+    # PREP_HOOK's mirror image. run.sh has finished but the sandbox still
+    # exists, so this is the only window in which the RESULT on disk can be
+    # inspected - what the symlink points at, what survived a failed
+    # migration. Assertions made after run_case returns would be examining a
+    # directory that has already been deleted, and would pass or fail for
+    # reasons that have nothing to do with run.sh.
+    if [[ -n "${POST_HOOK:-}" ]]; then
+        eval "$POST_HOOK"
+    fi
+
     rm -rf "$box"
     printf '%s' "$out"
 }
@@ -340,6 +350,40 @@ fi
 rm -rf "$box"
 
 # ---------------------------------------------------------------------------
+# The migration DELETES the source once it believes the copy worked, so the
+# dangerous case is not a copy that fails - it is a copy that reports success
+# having done nothing. That is not hypothetical: BusyBox `cp -an src/. dst/`
+# copies nothing and exits 0, which on a BusyBox base would have destroyed the
+# user's profiles. Stub cp to behave exactly that way and require run.sh to
+# notice by checking the destination rather than trusting the exit code.
+printf -- '\n--- 11b. a copy that lies about succeeding: refuse, keep the source ---\n'
+box="$(mktemp -d)"
+mkdir -p "$box/data" "$box/app/data" "$box/bin"
+echo '{"min_free_ram_mb":0}' > "$box/data/options.json"
+echo 'precious profile data' > "$box/app/data/profiles.db"
+printf 'MemAvailable:   12582912 kB\nSwapFree:        4194300 kB\n' > "$box/meminfo"
+printf '#!/usr/bin/env bash\necho UVICORN_STARTED\n' > "$box/bin/uvicorn"; chmod +x "$box/bin/uvicorn"
+printf '{"stub":true}\n' > "$box/app/.voicebox-model-policy.json"
+printf 'import sys\nsys.exit(0)\n' > "$box/bin/policy-verifier.py"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$box/bin/cp"; chmod +x "$box/bin/cp"
+out="$(PATH="$box/bin:$PATH" VOICEBOX_OPTIONS_FILE="$box/data/options.json" \
+     VOICEBOX_DATA_ROOT="$box/data" VOICEBOX_APP_ROOT="$box/app" \
+     VOICEBOX_MEMINFO="$box/meminfo" \
+     VOICEBOX_POLICY_RECEIPT="$box/app/.voicebox-model-policy.json" \
+     VOICEBOX_POLICY_VERIFIER="$box/bin/policy-verifier.py" bash "$RUN_SH" 2>&1 || true)"
+check        "refuses to start"          "persistence migration failed" "$out"
+check        "names what never arrived"  "did not arrive"               "$out"
+check        "says nothing was deleted"  "NOTHING has been deleted"     "$out"
+check_absent "never reaches uvicorn"     "UVICORN_STARTED"              "$out"
+[[ -f "$box/app/data/profiles.db" ]] \
+    && { printf '  PASS  the original data is still there\n'; PASS=$((PASS+1)); } \
+    || { printf '  FAIL  the original data was deleted anyway\n'; FAIL=$((FAIL+1)); }
+[[ ! -e "$box/data/app-data/.migrated" ]] \
+    && { printf '  PASS  not falsely marked as migrated\n'; PASS=$((PASS+1)); } \
+    || { printf '  FAIL  marked migrated despite copying nothing\n'; FAIL=$((FAIL+1)); }
+rm -rf "$box"
+
+# ---------------------------------------------------------------------------
 printf -- '\n--- 12. cpu_priority=low: runs under nice + ionice ---\n'
 out="$(run_case 12000 4096 '{"min_free_ram_mb":8192,"cpu_priority":"low"}' stub)"
 check    "announces low priority"  "CPU priority: low"       "$out"
@@ -417,12 +461,22 @@ check_rc     "exits cleanly"              "0"
 # quietly lost data, so it has to be validated by target, not by type.
 printf -- '\n--- 20. broken symlink at /app/data: repaired, not trusted ---\n'
 if ln -s /tmp "$(mktemp -d)/probe" 2>/dev/null; then
+    KEEP_BOX="$(mktemp -d)"
     PREP_HOOK='rm -rf "$box/app/data"; ln -s "$box/nonexistent-target" "$box/app/data"'
+    POST_HOOK='readlink -f "$box/app/data" > '"$KEEP_BOX"'/got 2>/dev/null || true; readlink -f "$box/data/app-data" > '"$KEEP_BOX"'/want 2>/dev/null || true'
     out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
-    PREP_HOOK=''
+    PREP_HOOK=''; POST_HOOK=''
     check "notices and repairs it" "re-pointing" "$out"
     check "still starts"           "UVICORN_STARTED" "$out"
     check_rc "exits cleanly"       "0"
+    # The wording is not the point - where the link ends up is. Assert that
+    # directly, or a reworded warning would masquerade as a working repair.
+    got="$(cat "$KEEP_BOX/got" 2>/dev/null || true)"
+    want="$(cat "$KEEP_BOX/want" 2>/dev/null || true)"
+    [[ -n "$want" && "$got" == "$want" ]] \
+        && { printf '  PASS  link now resolves to the persistent directory\n'; PASS=$((PASS+1)); } \
+        || { printf '  FAIL  link resolved to "%s", wanted "%s"\n' "$got" "$want"; FAIL=$((FAIL+1)); }
+    rm -rf "$KEEP_BOX"
 else
     printf '  SKIP  broken-symlink assertion — this filesystem has no symlink support\n'
 fi
@@ -435,14 +489,18 @@ if [[ "$(id -u)" != "0" ]] && ln -s /tmp "$(mktemp -d)/probe2" 2>/dev/null; then
     KEEP_BOX="$(mktemp -d)"
     # The copy itself must be what fails. Making $box/data unwritable would
     # abort the earlier cache mkdir instead, and never reach the migration.
-    PREP_HOOK='echo precious > "$box/app/data/profile.db"; chmod 000 "$box/app/data/profile.db"; echo "$box" > '"$KEEP_BOX"'/where'
+    PREP_HOOK='echo precious > "$box/app/data/profile.db"; chmod 000 "$box/app/data/profile.db"'
+    # Read the on-disk result while the sandbox still exists. Reading it after
+    # run_case returns was examining a deleted directory - which only appeared
+    # to pass because a chmod 000 file can defeat rm -rf on some platforms.
+    POST_HOOK='chmod 600 "$box/app/data/profile.db" 2>/dev/null || true
+        : > '"$KEEP_BOX"'/state
+        [[ -f "$box/app/data/profile.db" ]]     && printf "SOURCE_INTACT "   >> '"$KEEP_BOX"'/state
+        [[ -e "$box/data/app-data/.migrated" ]] && printf "MARKED_MIGRATED " >> '"$KEEP_BOX"'/state
+        true'
     out="$(run_case 12000 4096 '{"min_free_ram_mb":8192}')"
-    PREP_HOOK=''
-    box_path="$(cat "$KEEP_BOX/where" 2>/dev/null || true)"
-    chmod 600 "$box_path/app/data/profile.db" 2>/dev/null || true
-    state=""
-    [[ -f "$box_path/app/data/profile.db" ]]      && state+="SOURCE_INTACT "
-    [[ -e "$box_path/data/app-data/.migrated" ]]  && state+="MARKED_MIGRATED "
+    PREP_HOOK=''; POST_HOOK=''
+    state="$(cat "$KEEP_BOX/state" 2>/dev/null || true)"
     check        "refuses to start"              "persistence migration failed" "$out"
     check        "says nothing was deleted"      "NOTHING has been deleted"     "$out"
     check_absent "does not reach uvicorn"        "UVICORN_STARTED"              "$out"

@@ -253,7 +253,7 @@ if [[ -L "$APP_ROOT/data" ]]; then
     if [[ -n "$current" && -n "$expected" && "$current" == "$expected" ]]; then
         link_ok=true
     else
-        warn "$APP_ROOT/data resolves to '${current:-<broken>}', expected '$expected' - recreating it"
+        warn "$APP_ROOT/data resolves to '${current:-<broken>}', expected '$expected' - re-pointing it"
         rm -f "$APP_ROOT/data"
     fi
 fi
@@ -268,9 +268,50 @@ if [[ "$link_ok" != true ]]; then
     # start with the source still intact.
     if [[ -d "$APP_ROOT/data" && ! -L "$APP_ROOT/data" && ! -e "$DATA_ROOT/app-data/.migrated" ]]; then
         log "migrating existing $APP_ROOT/data into $DATA_ROOT/app-data"
-        if ! cp -an "$APP_ROOT/data/." "$DATA_ROOT/app-data/"; then
+
+        # Copied entry by entry, deliberately, instead of `cp -an src/. dst/`.
+        #
+        # BusyBox reads -n as "skip if the destination exists", sees the `.`
+        # target directory already there, and copies NOTHING - exiting 0 while
+        # it does. The old code took that 0 as success, wrote .migrated, and
+        # deleted the source. Reproduced on this host:
+        #
+        #   $ cp -an /tmp/mt/src/. /tmp/mt/dst/ ; echo $?   -> 0
+        #   $ find /tmp/mt/dst                              -> dst only, empty
+        #
+        # The published image is Debian-based, so its GNU cp does the right
+        # thing and no live data was ever at risk. But a step that deletes the
+        # user's profiles should not depend on which coreutils the base image
+        # happens to ship.
+        migrate_failed=""
+        for entry in "$APP_ROOT/data"/* "$APP_ROOT/data"/.[!.]*; do
+            if [[ ! -e "$entry" ]]; then continue; fi
+            entry_name="${entry##*/}"
+            # No-clobber: anything already in /data is the user's and wins.
+            if [[ -e "$DATA_ROOT/app-data/$entry_name" ]]; then continue; fi
+            if ! cp -a "$entry" "$DATA_ROOT/app-data/"; then
+                migrate_failed="$entry_name"
+                break
+            fi
+        done
+
+        # Verify rather than trust. The source is about to be deleted, and the
+        # bug above was precisely a copy that reported success having done
+        # nothing - so confirm each entry actually arrived.
+        migrate_missing=""
+        for entry in "$APP_ROOT/data"/* "$APP_ROOT/data"/.[!.]*; do
+            if [[ ! -e "$entry" ]]; then continue; fi
+            entry_name="${entry##*/}"
+            if [[ ! -e "$DATA_ROOT/app-data/$entry_name" ]]; then
+                migrate_missing="$migrate_missing $entry_name"
+            fi
+        done
+
+        if [[ -n "$migrate_failed" || -n "$migrate_missing" ]]; then
             warn "=========================================================="
             warn "Could not copy $APP_ROOT/data to $DATA_ROOT/app-data."
+            [[ -n "$migrate_failed" ]] && warn "  copy failed on: $migrate_failed"
+            [[ -n "$migrate_missing" ]] && warn "  did not arrive:$migrate_missing"
             warn "NOTHING has been deleted - the original data is untouched."
             warn "Check free space and permissions on $DATA_ROOT, then retry."
             warn "=========================================================="
