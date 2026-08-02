@@ -40,7 +40,7 @@ ARG BUILD_VERSION=0.3.0
 # It is included solely so the container is debuggable from `docker exec`.
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends bash tini curl; \
+    apt-get install -y --no-install-recommends bash tini curl sox; \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,18 @@ RUN set -eux; \
 #   by the project's standalone demo, which would fight the app's own
 #   FastAPI/pydantic versions.
 #
+#   --no-deps then makes its genuine runtime imports our problem, so they are
+#   listed explicitly below. The build-time import test is what tells us which
+#   ones are genuine: `sox` and `torchaudio` are imported at module scope by
+#   qwen_tts.core.tokenizer_25hz.vq.speech_vq, so they are required; gradio is
+#   not reached on the import path at all, confirming it is demo-only.
+#
+#   The image ships transformers 5.0.0 while qwen-tts asks for 4.57.3. We keep
+#   5.0.0: it is what the app's own Whisper support is running against, and
+#   downgrading it to satisfy a pin would trade a working feature for an
+#   unproven one. The import test below is what establishes whether qwen_tts
+#   tolerates 5.0.0 — if it does not, this build fails rather than shipping.
+#
 #   -c constraints, generated from the environment as it already exists, for
 #   everything else. pip is then free to ADD packages but cannot upgrade or
 #   downgrade anything already installed. If a genuine conflict exists, the
@@ -80,7 +92,7 @@ RUN set -eux; \
     echo "--- pinning $(wc -l < /tmp/vb-constraints.txt) existing packages as constraints ---"; \
     python3 -m pip install --no-cache-dir --no-deps "qwen-tts==0.1.1"; \
     python3 -m pip install --no-cache-dir -c /tmp/vb-constraints.txt \
-        einops soundfile librosa onnxruntime; \
+        einops soundfile librosa onnxruntime sox torchaudio; \
     rm -f /tmp/vb-constraints.txt
 
 # Prove both halves still work before shipping the image.
