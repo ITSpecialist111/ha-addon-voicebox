@@ -292,6 +292,11 @@ def main():
          '        model_size = data.model_size',
          "the /generate fallback was removed",
          1, -1),
+        ("main.py",
+         "        limit=limit,",
+         "        limit=int(limit),",
+         "the /history limit keyword was rewritten",
+         1, -1),
     ):
         with Sandbox(source) as s:
             s.sub(rel, old_text, new_text, expected=n_expected, count=n_count)
@@ -305,6 +310,65 @@ def main():
             check("MODEL POLICY FAILED" in a.stderr,
                   "  ...loudly", a.stderr[:160])
             check(not os.path.exists(s.receipt), "  ...and writes no receipt")
+
+    # ---------------------------------------------------------------
+    # Upstream returns HTTP 500 for /history?limit=101 and above, because
+    # list_history builds HistoryQuery INSIDE the handler where a pydantic
+    # ValidationError is no longer convertible to a 422. The frontend asks for
+    # limit=1000 on every History view, so the page 500s every time.
+    print("\n12. the /history 500 is repaired, and the fix is real")
+
+    accepts_1000 = (
+        "import io,sys\n"
+        "ns={}\n"
+        "exec(compile(io.open(sys.argv[1],encoding='utf-8').read(),'m','exec'),ns)\n"
+        "try:\n"
+        "    ns['HistoryQuery'](limit=1000); print('ACCEPTED')\n"
+        "except Exception: print('REJECTED')\n"
+    )
+
+    # First prove the bug is real in the pristine source, so that the
+    # post-patch assertion below is meaningful rather than vacuous.
+    with Sandbox(source) as s:
+        r = subprocess.run([sys.executable, "-c", accepts_1000, s.path("models.py")],
+                           capture_output=True, text=True)
+        check("REJECTED" in r.stdout,
+              "unpatched source really does reject limit=1000 (this IS the 500)",
+              r.stdout)
+
+    with Sandbox(source) as s:
+        s.apply()
+        r = subprocess.run([sys.executable, "-c", accepts_1000, s.path("models.py")],
+                           capture_output=True, text=True)
+        check("ACCEPTED" in r.stdout,
+              "patched source accepts the limit=1000 the frontend sends", r.stdout)
+
+        # The clamp is the belt to the cap's braces: nothing a caller can send
+        # should be able to reach the raising path at all.
+        sweep = (
+            "import io,sys\n"
+            "ns={}\n"
+            "exec(compile(io.open(sys.argv[1],encoding='utf-8').read(),'m','exec'),ns)\n"
+            "HQ=ns['HistoryQuery']\n"
+            "bad=[]\n"
+            "for v in (-99999,-5,0,1,50,100,101,1000,1001,99999):\n"
+            "    try: HQ(limit=max(1,min(v,1000)))\n"
+            "    except Exception: bad.append(v)\n"
+            "print('BAD=%r'%(bad,))\n"
+        )
+        r = subprocess.run([sys.executable, "-c", sweep, s.path("models.py")],
+                           capture_output=True, text=True)
+        check("BAD=[]" in r.stdout,
+              "no clamped input can raise, so no input can 500", r.stdout)
+
+        src = s.read("main.py")
+        check("limit=max(1, min(limit, 1000))" in src,
+              "list_history clamps before building the query")
+        v = s.verify()
+        check(v.returncode == 0, "verify passes with the history fix applied", v.stderr)
+        check("HistoryQuery accepts limit=1000" in v.stdout,
+              "verify reports the history cap")
+        check("clamps limit" in v.stdout, "verify reports the clamp")
 
     # ---------------------------------------------------------------
     print("\n%d passed, %d failed" % (PASS, FAIL))

@@ -67,6 +67,24 @@ import sys
 
 RECEIPT = "/app/.voicebox-model-policy.json"
 
+# Upstream defect, unrelated to memory but repaired here because this is the
+# one place that already owns models.py and main.py.
+#
+#   models.py  HistoryQuery.limit is Field(ge=1, le=100)
+#   main.py    list_history declares `limit: int = 50` with NO validation, then
+#              constructs HistoryQuery(limit=limit) INSIDE the handler body
+#
+# FastAPI only converts a ValidationError into a 422 while parsing the request.
+# Raised inside the handler it is just an unhandled exception, so /history with
+# any limit above 100 returns HTTP 500. The shipped frontend hardcodes
+# limit=1000, so the History view 500s on every load and takes the UI down with
+# it - which looks exactly like "ingress is broken". Verified live on the target
+# host: limit=100 -> 200, limit=101 -> 500.
+#
+# Fixed on both sides: widen the cap to what the frontend actually asks for, and
+# clamp in the handler so no input can reach the 500 path at all.
+HISTORY_LIMIT_MAX = 1000
+
 # SHA-256 of each file as shipped in the image this add-on is built against
 # (ghcr.io/jamiepine/voicebox@sha256:b7e39a79...9532, amd64). Verified by
 # extracting the 72 KB layer that carries app/backend and hashing it directly.
@@ -254,7 +272,25 @@ def patch_models(src):
         raise PolicyError("models.py: GenerationRequest.model_size not found")
     old = '    model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\\\.7B|0\\\\.6B)$")'
     new = '    model_size: Optional[str] = Field(default="0.6B", pattern="^(1\\\\.7B|0\\\\.6B)$")'
-    return replace_line(src, target.lineno, old, new, "models.py model_size default")
+    src = replace_line(src, target.lineno, old, new, "models.py model_size default")
+
+    # --- upstream /history 500 (see HISTORY_LIMIT_MAX) ---
+    hq = find_class(tree, "HistoryQuery", "models.py")
+    lims = [
+        n for n in hq.body
+        if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", None) == "limit"
+    ]
+    if len(lims) != 1:
+        raise PolicyError(
+            "models.py: expected exactly one HistoryQuery.limit, found %d" % len(lims)
+        )
+    src = replace_line(
+        src, lims[0].lineno,
+        "    limit: int = Field(default=50, ge=1, le=100)",
+        "    limit: int = Field(default=50, ge=1, le=%d)" % HISTORY_LIMIT_MAX,
+        "models.py HistoryQuery.limit cap",
+    )
+    return src
 
 
 def patch_main(src):
@@ -304,6 +340,40 @@ def patch_main(src):
         'async def load_model(model_size: str = "1.7B"):',
         'async def load_model(model_size: str = "0.6B"):',
         "main.py /models/load default",
+    )
+
+    # --- upstream /history 500 (see HISTORY_LIMIT_MAX) ---
+    hists = [
+        n for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "list_history"
+    ]
+    if len(hists) != 1:
+        raise PolicyError(
+            "main.py: expected exactly one list_history route, found %d" % len(hists)
+        )
+    calls = [
+        n for n in ast.walk(hists[0])
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "HistoryQuery"
+    ]
+    if len(calls) != 1:
+        raise PolicyError(
+            "main.py: expected exactly one models.HistoryQuery(...) in "
+            "list_history, found %d" % len(calls)
+        )
+    kws = [k for k in calls[0].keywords if k.arg == "limit"]
+    if len(kws) != 1:
+        raise PolicyError(
+            "main.py: expected exactly one limit= keyword in the HistoryQuery "
+            "call, found %d" % len(kws)
+        )
+    src = replace_line(
+        src, kws[0].value.lineno,
+        "        limit=limit,",
+        "        limit=max(1, min(limit, %d)),  # vb: upstream 500s above the cap"
+        % HISTORY_LIMIT_MAX,
+        "main.py /history limit clamp",
     )
     return src
 
@@ -457,6 +527,29 @@ def verify(root):
                     % (name, node.lineno)
                 )
     checks.append("main.py /generate and /models/load contain no 1.7B literal")
+
+    # --- /history no longer 500s above the old cap ---------------------
+    hq = ns["HistoryQuery"]
+    if hq(limit=HISTORY_LIMIT_MAX).limit != HISTORY_LIMIT_MAX:
+        raise PolicyError("HistoryQuery rejected limit=%d" % HISTORY_LIMIT_MAX)
+    checks.append("HistoryQuery accepts limit=%d (frontend asks for 1000)" % HISTORY_LIMIT_MAX)
+
+    hists = [
+        n for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "list_history"
+    ]
+    if len(hists) != 1:
+        raise PolicyError("main.py: list_history is no longer unique")
+    clamped = any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", None) == "min"
+        for n in ast.walk(hists[0])
+    )
+    if not clamped:
+        raise PolicyError(
+            "main.py: list_history does not clamp limit - an oversized limit "
+            "would still reach the 500 path."
+        )
+    checks.append("main.py /history clamps limit before building the query")
 
     for line in checks:
         print("  OK  %s" % line)

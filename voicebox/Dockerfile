@@ -26,7 +26,7 @@ FROM ghcr.io/jamiepine/voicebox:${VOICEBOX_TAG}
 # explicit by necessity as well as by preference.
 
 ARG BUILD_ARCH=amd64
-ARG BUILD_VERSION=0.6.0
+ARG BUILD_VERSION=0.6.1
 
 # tini gives correct signal forwarding and zombie reaping, so uvicorn actually
 # receives SIGTERM when Home Assistant stops the add-on.

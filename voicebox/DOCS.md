@@ -379,6 +379,25 @@ A quick way to tell the two failure modes apart in the browser console:
 
 Rebuilding the add-on re-applies the patch.
 
+### The UI loads but the History view is blank or errors
+
+Fixed in 0.6.1. Upstream's `GET /history` declares `limit: int = 50` with no
+validation, then builds a `HistoryQuery` inside the handler body, where the
+model caps `limit` at 100. A pydantic error raised there is no longer
+convertible to a 422, so it surfaces as an unhandled exception:
+
+```
+GET /history?limit=100  -> 200
+GET /history?limit=101  -> 500 Internal Server Error
+```
+
+The shipped frontend hardcodes `limit=1000`, so this fired on every History
+load. Because it is thrown during render rather than caught, it can blank the
+whole page — which looks like ingress being broken when it is not.
+
+The build now widens the cap to 1000 and clamps the value in the handler, so no
+request can reach the raising path.
+
 ### Voice generation fails with `No module named 'qwen_tts'`
 
 That is the published upstream image, which ships **without a TTS engine** —
