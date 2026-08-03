@@ -16,11 +16,17 @@ If the decorator ran, the dispatch function is our function. If it did not,
 nothing here can hide that. Run as a build step so the image fails instead of
 the add-on.
 """
+import os
+import shutil
 import sys
+import tempfile
 
-# Defaults to the image layout; an explicit path lets the test suite run this
-# against a fixture, so the check itself is exercised rather than trusted.
-BACKEND = sys.argv[1] if len(sys.argv) > 1 else "/app/backend"
+# The app ROOT, not the backend directory. backend/main.py uses relative
+# imports, so it has to be imported as `backend.main` with the root on
+# sys.path - importing it as a top-level `main` raises "attempted relative
+# import with no known parent package". An explicit path lets the test suite
+# run this against a fixture, so the check is exercised rather than trusted.
+ROOT = sys.argv[1] if len(sys.argv) > 1 else "/app"
 NAME = "_vb_spa_deep_links"
 
 
@@ -30,9 +36,14 @@ def fail(msg: str) -> "typing.NoReturn":  # noqa: F821
     raise SystemExit(1)
 
 
-sys.path.insert(0, BACKEND)
+sys.path.insert(0, ROOT)
+
+# Importing the backend creates a ./data directory as a side effect, so do it
+# somewhere disposable rather than littering the image layer.
+_scratch = tempfile.mkdtemp(prefix="vb-verify-")
+os.chdir(_scratch)
 try:
-    import main
+    from backend import main
 except Exception as exc:  # noqa: BLE001 - any import failure is fatal here
     fail(
         f"the patched backend does not import: {type(exc).__name__}: {exc}\n"
@@ -66,4 +77,5 @@ if not routes:
         "never match a reload"
     )
 
+shutil.rmtree(_scratch, ignore_errors=True)
 print(f"runtime check: {NAME} registered, covering {sorted(routes)}")

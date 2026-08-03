@@ -877,7 +877,7 @@ def main() -> int:
     elif not _has_server_libs():
         skip("fastapi/starlette not installed - cannot import the patched app")
     else:
-        def live_fixture(td: str) -> pathlib.Path:
+        def live_fixture(td: str, main_py: str = REAL_MAIN_PY) -> pathlib.Path:
             """A fixture whose mount branch is actually taken.
 
             main.py mounts Path(__file__).parent.parent / "web" / "dist", so
@@ -885,7 +885,7 @@ def main() -> int:
             and NOTHING is registered - which is precisely what this check
             exists to detect. Create it so the good case is genuinely good.
             """
-            root = make_fixture(pathlib.Path(td))
+            root = make_fixture(pathlib.Path(td), main_py=main_py)
             dist = root / "web" / "dist"
             dist.mkdir(parents=True)
             (dist / "index.html").write_text("<div id=root></div>",
@@ -894,7 +894,7 @@ def main() -> int:
 
         def run_runtime(root: pathlib.Path) -> subprocess.CompletedProcess:
             return subprocess.run(
-                [sys.executable, str(runtime), str(root / "backend")],
+                [sys.executable, str(runtime), str(root)],
                 capture_output=True, text=True)
 
         def rewrite(root: pathlib.Path, text: str) -> None:
@@ -912,6 +912,33 @@ def main() -> int:
                   (r.stdout + r.stderr)[-400:])
             check("...and reports the routes it covers",
                   "/models" in r.stdout, r.stdout[-200:])
+
+        with tempfile.TemporaryDirectory() as td:
+            # The shipped backend/main.py uses RELATIVE imports, so it can only
+            # be imported as `backend.main` with the app root on sys.path.
+            # Importing it as a top-level `main` raises "attempted relative
+            # import with no known parent package".
+            #
+            # This case exists because the fixture above has no relative import,
+            # so it loads happily under either style - and a build was therefore
+            # published with the wrong one. The fixture was more forgiving than
+            # the image, which is the only kind of test failure that matters.
+            rel = REAL_MAIN_PY.replace(
+                "from pathlib import Path",
+                "from pathlib import Path\nfrom .settings import MARKER", 1)
+            check("the relative-import fixture differs", rel != REAL_MAIN_PY)
+            root = live_fixture(td, main_py=rel)
+            (root / "backend" / "settings.py").write_text(
+                "MARKER = 1\n", encoding="utf-8")
+            setup = run(root)
+            check("a backend with relative imports patches cleanly",
+                  setup.returncode == 0, setup.stderr[-200:])
+            r = run_runtime(root)
+            check("...and is imported as a package, not a loose module",
+                  r.returncode == 0, (r.stdout + r.stderr)[-400:])
+            check("...so no 'no known parent package' error",
+                  "no known parent package" not in (r.stdout + r.stderr),
+                  r.stderr[-300:])
 
         with tempfile.TemporaryDirectory() as td:
             # A decorator that does nothing. The function is still defined with
