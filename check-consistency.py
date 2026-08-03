@@ -105,6 +105,19 @@ report(bool(bv) and bv.group(1) == str(cfg["version"]),
        f"Dockerfile BUILD_VERSION {bv.group(1) if bv else 'missing'} "
        f"!= config.yaml version {cfg['version']}")
 
+# Supervisor can only substitute the LAN address into webui's [HOST], so the
+# button it renders is a private-IP, plain-HTTP URL. Through any HTTPS front
+# door (Cloudflare Tunnel here) that is unroutable AND mixed content, and the
+# add-on looks broken while running fine. Ingress covers both cases.
+report("webui" not in cfg,
+       "no webui button (it would emit a LAN-only http:// URL)",
+       f"config.yaml sets webui: {cfg.get('webui')!r} - that URL cannot work "
+       "from a remote HTTPS session; rely on ingress instead")
+
+report(cfg.get("ingress") is True and cfg.get("ingress_port") == 8000,
+       "ingress enabled on port 8000 (the only advertised entry point)",
+       "ingress must stay enabled - with no webui it is the sole entry point")
+
 print()
 # The published image has no /mcp endpoint - verified against the running
 # container's own /openapi.json. Claiming otherwise sends users and agents at a

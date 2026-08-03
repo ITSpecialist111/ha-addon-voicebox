@@ -1,5 +1,5 @@
 name: Voicebox
-version: "0.7.2"
+version: "0.7.3"
 slug: voicebox
 description: >-
   Local AI voice studio — text-to-speech, voice cloning and transcription.
@@ -30,7 +30,15 @@ ports_description:
     POST /shutdown — so only expose it on a trusted LAN. Prefer the ingress
     panel, which puts Home Assistant's own login in front of it.
 
-webui: "http://[HOST]:[PORT:8000]/"
+# NO webui: on purpose.
+# `webui` renders an "OPEN WEB UI" button, and Supervisor can only fill [HOST]
+# with the LAN address — producing http://192.168.68.57:17493/. Opened from a
+# remote session (Cloudflare Tunnel, Nabu Casa, any HTTPS front door) that URL
+# is both unroutable and mixed content, so the browser refuses it and the
+# add-on looks broken when it is running perfectly. Ingress gives the same UI
+# behind Home Assistant's login and works on the LAN and remotely alike, so it
+# is the only entry point advertised. The direct port below stays published
+# for anyone who wants it from the LAN.
 
 # Ingress puts the UI behind Home Assistant's own authentication, which matters
 # because Voicebox itself has none.
