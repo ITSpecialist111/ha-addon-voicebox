@@ -45,6 +45,9 @@ Usage:
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import json
 import pathlib
 import re
 import sys
@@ -112,6 +115,66 @@ SSE_BASE_MARKER = '${window.__VB_BASE__||""}/models/progress/'
 RE_DEFAULT_ORIGIN = re.compile(r'"http://127\.0\.0\.1:17493"')
 DEFAULT_ORIGIN_PATCHED = '(window.__VB_BASE__||location.origin)'
 
+# Client-side routes. Navigating to one never touches the server - TanStack
+# pushes history - but RELOADING one does, and then the app disappears: /models
+# has no API route and 404s, while /stories has one and answers raw JSON.
+#
+# StaticFiles(html=True) cannot fix this. Given a directory it answers 307 to the
+# path plus "/", and Starlette rebuilds that Location from the proxied request,
+# WITHOUT the /api/hassio_ingress/<token> prefix - so the browser would be sent
+# out of the add-on entirely. Measured against Starlette, not assumed.
+#
+# Read from the route table rather than the navigation sidebar: the sidebar is a
+# presentation list and could omit a route that still exists.
+RE_SPA_ROUTE = re.compile(
+    r'getParentRoute:\(\)=>[A-Za-z_$][A-Za-z0-9_$]*,\s*path:"(/[^"]*)"'
+)
+
+# The single statement that serves the built SPA. Anchored on the whole call so
+# that an upstream change to how it is mounted fails loudly rather than leaving
+# the fallback silently unattached.
+RE_SPA_MOUNT = re.compile(
+    r'^([ \t]*)app\.mount\(\s*"/",\s*StaticFiles\(\s*directory=str\('
+    r'_web_dist_path\s*\),\s*html=True\s*\),\s*name="web"\s*\)[ \t]*$',
+    re.MULTILINE,
+)
+SPA_FALLBACK_MARKER = "_vb_spa_deep_links"
+
+# enforce-model-policy.py records a hash of every file it patched, and run.sh
+# re-checks those hashes on EVERY start - that is what makes a tampered image
+# fail loudly instead of quietly running without the 1.7B guard. Editing main.py
+# afterwards therefore has to re-seal the hash, or the add-on would report a
+# policy failure at every boot.
+POLICY_RECEIPT = ".voicebox-model-policy.json"
+
+# Inserted directly after the mount, inside the same `if` block, so it is added
+# only when there is a built frontend to serve.
+SPA_FALLBACK = '''
+{i}# --- Home Assistant ingress deep links (added by patch-frontend.py) ---
+{i}# Reloading a client-side route must return the app, not a 404 and not raw
+{i}# API JSON. Middleware runs BEFORE routing, so this also covers routes that
+{i}# collide with a real endpoint - a catch-all route could never reach those,
+{i}# because the endpoint matches first.
+{i}#
+{i}# The route list is extracted from the built bundle at image-build time, so a
+{i}# route added upstream is picked up instead of quietly missing its fallback.
+{i}# The Accept test leaves API clients untouched: the web UI sets no Accept
+{i}# header at all, so only a real browser navigation can match here.
+{i}_VB_SPA_ROUTES = frozenset({routes!r})
+{i}_VB_SPA_INDEX = _web_dist_path / "index.html"
+
+{i}@app.middleware("http")
+{i}async def _vb_spa_deep_links(request, call_next):
+{i}    if (
+{i}        request.method in ("GET", "HEAD")
+{i}        and request.url.path.rstrip("/") in _VB_SPA_ROUTES
+{i}        and "text/html" in request.headers.get("accept", "")
+{i}        and _VB_SPA_INDEX.is_file()
+{i}    ):
+{i}        return FileResponse(_VB_SPA_INDEX, media_type="text/html")
+{i}    return await call_next(request)
+'''
+
 SKIP_DIRS = {"node_modules", ".git", "site-packages", "__pycache__", "dist-info"}
 
 
@@ -161,6 +224,271 @@ def add_basepath(m: "re.Match[str]") -> str:
             "reported success. Update patch-frontend.py to replace that value."
         )
     return m.group(0) + ROUTER_MARKER
+
+
+def spa_routes(assets: pathlib.Path) -> tuple[str, ...]:
+    """Every client-side route that a browser could be reloaded on."""
+    found: set[str] = set()
+    for js in sorted(assets.glob("*.js")):
+        text = js.read_text(encoding="utf-8").replace("\r\n", "\n")
+        for raw in RE_SPA_ROUTE.findall(text):
+            route = "/" + "/".join(seg for seg in raw.split("/") if seg)
+            if route == "/":
+                continue  # the index route is already served by the mount itself
+            if "$" in route or "*" in route:
+                # A parameterised route cannot be listed ahead of time, and
+                # skipping it silently would ship a reload that still 404s.
+                # The upstream image is pinned by digest, so this can only
+                # appear when we deliberately bump it - exactly when a loud
+                # failure is cheap and a silent gap is not.
+                raise PatchError(
+                    f"the bundle declares a parameterised route ({route!r}) "
+                    "which the deep-link fallback cannot enumerate. Reloading "
+                    "it would still lose the app. Teach spa_routes() to emit a "
+                    "prefix match before shipping this image."
+                )
+            found.add(route)
+    return tuple(sorted(found))
+
+
+def assert_live_middleware(source: str, routes: tuple[str, ...]) -> None:
+    """Assert the fallback is an ACTIVE middleware, not merely present.
+
+    This project has shipped two patches that were present and inert: the
+    0.4.0 backend patch that targeted files which did not exist, and the 0.7.0
+    model guard that accepted `if False: _vb_enforce_model_size(...)`. Both
+    reported success. A substring test for the marker repeats that mistake -
+    it passes on a comment, on a removed decorator, and on `and False`.
+
+    So the emitted construct is asserted through the AST instead: a real async
+    function, really decorated with app.middleware("http"), whose guard is not
+    a constant and which really returns a FileResponse.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise PatchError(f"main.py does not parse: {exc}") from exc
+
+    fn = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.AsyncFunctionDef)
+                and node.name == SPA_FALLBACK_MARKER):
+            fn = node
+            break
+    if fn is None:
+        raise PatchError(
+            "main.py has no deep-link fallback: no async "
+            f"{SPA_FALLBACK_MARKER} function is defined, so reloading any "
+            "route would lose the app. A marker in a comment or a string does "
+            "not count - this is checked through the AST precisely because a "
+            "substring test passes on a patch that never took."
+        )
+
+    decorated = any(
+        isinstance(d, ast.Call)
+        and isinstance(d.func, ast.Attribute)
+        and d.func.attr == "middleware"
+        and isinstance(d.func.value, ast.Name)
+        and d.func.value.id == "app"
+        and [a for a in d.args
+             if isinstance(a, ast.Constant) and a.value == "http"]
+        for d in fn.decorator_list
+    )
+    if not decorated:
+        raise PatchError(
+            f"{SPA_FALLBACK_MARKER} is defined but not registered with "
+            '@app.middleware("http"), so it never runs and every reload still '
+            "returns a 404"
+        )
+
+    guard = next((n for n in fn.body if isinstance(n, ast.If)), None)
+    if guard is None:
+        raise PatchError(f"{SPA_FALLBACK_MARKER} has no guard - it would "
+                         "intercept every request, not just SPA reloads")
+    if isinstance(guard.test, ast.Constant):
+        raise PatchError(
+            f"{SPA_FALLBACK_MARKER}'s guard is the constant "
+            f"{guard.test.value!r}, so it is inert (or intercepts everything)"
+        )
+
+    # `False and <the real test>` is a BoolOp, not a Constant, so the check
+    # above sails past it - and that is precisely the shape that got the 0.7.0
+    # model guard shipped inert. Any constant operand of an and/or inside the
+    # guard is either dead weight or a short circuit; neither belongs here.
+    for node in ast.walk(guard.test):
+        if isinstance(node, ast.BoolOp):
+            for operand in node.values:
+                if isinstance(operand, ast.Constant):
+                    raise PatchError(
+                        f"{SPA_FALLBACK_MARKER}'s guard short-circuits on the "
+                        f"constant {operand.value!r}, so it never matches a "
+                        "real reload"
+                    )
+
+    # And the guard must actually be about SPA routes. A guard that is neither
+    # constant nor short-circuited can still have been replaced by something
+    # unrelated that happens to parse.
+    if not any(
+        isinstance(node, ast.Name) and node.id == "_VB_SPA_ROUTES"
+        for node in ast.walk(guard.test)
+    ):
+        raise PatchError(
+            f"{SPA_FALLBACK_MARKER}'s guard does not consult _VB_SPA_ROUTES, "
+            "so it is not deciding what it is supposed to decide"
+        )
+
+    served = any(
+        isinstance(n, ast.Return)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+        and n.value.func.id == "FileResponse"
+        for n in ast.walk(guard)
+    )
+    if not served:
+        raise PatchError(
+            f"{SPA_FALLBACK_MARKER} matches a reload but never returns a "
+            "FileResponse, so the app is still not served"
+        )
+
+    listed = {
+        elt.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_VB_SPA_ROUTES"
+                for t in node.targets)
+        for call in ([node.value] if isinstance(node.value, ast.Call) else [])
+        for arg in call.args
+        for elt in getattr(arg, "elts", [])
+        if isinstance(elt, ast.Constant)
+    }
+    missing = sorted(set(routes) - listed)
+    if missing:
+        raise PatchError(
+            "the deep-link fallback's route set does not cover "
+            + ", ".join(missing)
+            + " - reloading those would still lose the app"
+        )
+
+
+def read_py(path: pathlib.Path) -> str:
+    """Read a Python source file WITHOUT translating line endings.
+
+    enforce-model-policy.py hashes main.py through an identical newline=""
+    read. If this module read through Python's default translation, then on a
+    CRLF checkout the two would hash different strings and the re-sealed
+    receipt would be wrong - which run.sh reports as a model-policy failure on
+    every single start. Same reason, same handling, deliberately.
+    """
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def write_py(path: pathlib.Path, text: str) -> None:
+    """Write Python source verbatim - see read_py."""
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def reseal_policy_receipt(root: pathlib.Path, main_py: pathlib.Path,
+                          was: str | None = None) -> str | None:
+    """Update the recorded hash of main.py after the fallback was inserted.
+
+    Only the hash moves. Everything that gives the receipt its value is left
+    alone and still runs at boot: the policy block is exec'd out of
+    pytorch_backend.py and main.py's AST is re-asserted, so a guard that had
+    been removed or neutered would still be caught.
+
+    Hashed the same way enforce-model-policy.py hashes it - decoded text read
+    with newline="", not raw bytes and not translated - so the two agree on a
+    checkout with CRLF line endings.
+    """
+    receipt = root / POLICY_RECEIPT
+    if not receipt.is_file():
+        return None  # policy not applied yet; the Dockerfile orders it first
+
+    data = json.loads(receipt.read_text(encoding="utf-8"))
+    after = data.get("after")
+    if not isinstance(after, dict) or "main.py" not in after:
+        raise PatchError(
+            f"{receipt} records no hash for main.py, so it cannot be re-sealed "
+            "- the model policy would fail to verify on every start"
+        )
+
+    # Re-seal ONLY over an edit this script made. If main.py did not match the
+    # receipt before the fallback went in, something else changed it between
+    # the policy step and here - and re-sealing would silently bless that too,
+    # turning a tripwire into a rubber stamp.
+    if was is not None and after["main.py"] not in (was, None):
+        raise PatchError(
+            "main.py did not match the model-policy receipt BEFORE the "
+            "deep-link fallback was added, so something else modified it "
+            f"(receipt {after['main.py'][:12]}..., actual {was[:12]}...). "
+            "Refusing to re-seal: that would hide the change instead of "
+            "reporting it."
+        )
+
+    digest = hashlib.sha256(read_py(main_py).encode("utf-8")).hexdigest()
+    if after["main.py"] == digest:
+        return None
+    after["main.py"] = digest
+    receipt.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return "model-policy receipt re-sealed over the deep-link fallback"
+
+
+def patch_backend(root: pathlib.Path, routes: tuple[str, ...]) -> list[str]:
+    main_py = root / "backend" / "main.py"
+    if not main_py.is_file():
+        raise PatchError(
+            f"{main_py} does not exist, so reloading a route cannot be made to "
+            "return the app"
+        )
+
+    # Work in LF and restore whatever the file actually used. The container's
+    # copy is LF, but a CRLF checkout would otherwise defeat RE_SPA_MOUNT - its
+    # [ \t]*$ cannot match a trailing \r - and the fallback would refuse to
+    # attach for a reason that has nothing to do with the upstream code.
+    raw = read_py(main_py)
+    was = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    original = raw.replace("\r\n", "\n")
+    if SPA_FALLBACK_MARKER in original:
+        notes = ["main.py: deep-link fallback already present"]
+        # The receipt may have been written by a later step on a previous run.
+        resealed = reseal_policy_receipt(root, main_py)
+        if resealed:
+            notes.append(resealed)
+        return notes
+
+    if not routes:
+        raise PatchError(
+            "found no client-side routes in the bundle, so the deep-link "
+            "fallback would be empty and every reload would still fail"
+        )
+
+    match = RE_SPA_MOUNT.search(original)
+    if not match:
+        raise PatchError(
+            "main.py: could not find the StaticFiles mount that serves the web "
+            "UI - the deep-link fallback has nothing to attach to"
+        )
+
+    block = SPA_FALLBACK.format(i=match.group(1), routes=routes)
+    text = original[: match.end()] + "\n" + block + original[match.end():]
+
+    try:
+        compile(text, str(main_py), "exec")
+    except SyntaxError as exc:
+        raise PatchError(f"main.py: patch produced invalid Python: {exc}") from exc
+    assert_live_middleware(text, routes)
+
+    write_py(main_py, text.replace("\n", newline)
+             if newline != "\n" else text)
+
+    notes = ["main.py: reloading " + ", ".join(routes) + " now returns the app"]
+    resealed = reseal_policy_receipt(root, main_py, was)
+    if resealed:
+        notes.append(resealed)
+    return notes
 
 
 def find_frontend(root: pathlib.Path) -> pathlib.Path:
@@ -298,7 +626,7 @@ def patch_bundles(assets: pathlib.Path) -> list[str]:
     return notes
 
 
-def verify(frontend: pathlib.Path) -> None:
+def verify(frontend: pathlib.Path, root: pathlib.Path) -> None:
     index = (frontend / "index.html").read_text(encoding="utf-8")
     if MARKER not in index:
         raise PatchError("index.html is missing the base-path snippet")
@@ -338,6 +666,28 @@ def verify(frontend: pathlib.Path) -> None:
     ):
         raise PatchError("no bundle contains a router with an ingress basepath")
 
+    routes = spa_routes(assets)
+    if not routes:
+        raise PatchError("found no client-side routes in the bundle")
+    main_py = root / "backend" / "main.py"
+    if not main_py.is_file():
+        raise PatchError(f"{main_py} does not exist")
+    on_disk = read_py(main_py)
+    assert_live_middleware(on_disk.replace("\r\n", "\n"), routes)
+
+    receipt = root / POLICY_RECEIPT
+    if receipt.is_file():
+        recorded = json.loads(receipt.read_text(encoding="utf-8")).get("after", {})
+        # Hash what is ON DISK, not a normalised copy: enforce-model-policy.py
+        # reads with newline="" too, and comparing a normalised hash against a
+        # verbatim one would fail on a CRLF checkout for no real reason.
+        digest = hashlib.sha256(on_disk.encode("utf-8")).hexdigest()
+        if recorded.get("main.py") not in (None, digest):
+            raise PatchError(
+                "the model-policy receipt does not match the patched main.py, "
+                "so the add-on would report a policy failure on every start"
+            )
+
 
 def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if not a.startswith("--")]
@@ -351,13 +701,14 @@ def main(argv: list[str]) -> int:
     try:
         frontend = find_frontend(root)
         if check_only:
-            verify(frontend)
+            verify(frontend, root)
             print(f"patch-frontend: {frontend} is patched")
             return 0
 
         notes = patch_index(frontend / "index.html")
         notes += patch_bundles(frontend / "assets")
-        verify(frontend)
+        notes += patch_backend(root, spa_routes(frontend / "assets"))
+        verify(frontend, root)
     except PatchError as exc:
         print(f"patch-frontend: FAILED: {exc}", file=sys.stderr)
         return 1

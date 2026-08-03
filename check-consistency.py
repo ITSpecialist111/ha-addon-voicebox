@@ -173,4 +173,49 @@ report("qwen-tts" in dockerfile,
        "Dockerfile installs the missing qwen-tts engine",
        "Dockerfile does not install qwen-tts - TTS model downloads will fail")
 
+# Two build steps now edit backend/main.py, and the order is load-bearing.
+# enforce-model-policy.py pins a SHA-256 of pristine upstream main.py and
+# refuses to apply once it has moved, so it has to see the file first - with
+# patch-frontend.py ahead of it the image does not build at all. Getting this
+# wrong once cost a full build cycle to diagnose; it is cheaper to assert it.
+_policy_at = dockerfile.find("enforce-model-policy.py")
+_frontend_at = dockerfile.find("patch-frontend.py")
+report(_policy_at != -1 and _frontend_at != -1 and _policy_at < _frontend_at,
+       "enforce-model-policy runs before patch-frontend (both edit main.py)",
+       "patch-frontend.py runs before enforce-model-policy.py. The policy "
+       "refuses to patch a main.py whose hash has moved, so the build will "
+       "fail with 'main.py has changed upstream'.")
+
+# patch-frontend.py re-seals the policy receipt after it edits main.py, and
+# run.sh re-runs the policy verifier at EVERY boot. So a re-seal that goes
+# wrong builds perfectly and then fails every single start. Requiring a second
+# --verify after the frontend patch moves that failure into the build log,
+# where it costs one build instead of a support round-trip.
+_frontend_run = dockerfile.find("patch-frontend.py /app")
+_last_verify = dockerfile.rfind("--verify")
+report(_frontend_run != -1 and _last_verify > _frontend_run,
+       "model policy is re-verified after the frontend patch",
+       "Dockerfile does not re-verify the model policy after patch-frontend.py "
+       "re-seals the receipt, so a corrupt re-seal would fail at every boot "
+       "instead of failing the build.")
+
+# An AST assertion proves the patch is WRITTEN correctly. It cannot prove the
+# decorator RAN. This project has twice shipped a patch that was present and
+# inert, and reported success both times; importing the patched app is the
+# only step that tells those two apart.
+_runtime_at = dockerfile.rfind('verify-runtime.py"]')
+if _runtime_at == -1:
+    report(False, "",
+           "Dockerfile never runs verify-runtime.py, so a deep-link patch "
+           "that is present but never registered would ship.")
+else:
+    report(_runtime_at > _frontend_run,
+           "the patched backend is imported and checked at build time",
+           "verify-runtime.py runs BEFORE patch-frontend.py, so it imports an "
+           "unpatched app and passes without checking anything. Move it after "
+           "the frontend patch.")
+report(pathlib.Path("voicebox/verify-runtime.py").is_file(),
+       "verify-runtime.py present",
+       "voicebox/verify-runtime.py is missing - the Dockerfile COPY will fail")
+
 sys.exit(rc)

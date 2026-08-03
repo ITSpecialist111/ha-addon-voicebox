@@ -42,7 +42,7 @@ FROM ghcr.io/jamiepine/voicebox@${VOICEBOX_DIGEST}
 # explicit by necessity as well as by preference.
 
 ARG BUILD_ARCH=amd64
-ARG BUILD_VERSION=0.7.3
+ARG BUILD_VERSION=0.7.4
 
 # tini gives correct signal forwarding and zombie reaping, so uvicorn actually
 # receives SIGTERM when Home Assistant stops the add-on.
@@ -163,22 +163,6 @@ RUN set -eux; \
     rm -rf /tmp/data
 
 # ---------------------------------------------------------------------------
-# Web UI
-# ---------------------------------------------------------------------------
-# The shipped frontend is a desktop-app build: it calls a hardcoded
-# http://127.0.0.1:17493 and references its assets with absolute paths. Served
-# from a server the browser is not sitting on, every API call goes to the
-# browser's own machine, and under ingress the assets 404 against the Home
-# Assistant origin. Neither the direct port nor ingress produces a working UI.
-#
-# patch-frontend.py rewrites both to be relative to wherever the page is
-# actually served from. It verifies its own work and exits non-zero if the
-# upstream bundle no longer matches, so this fails the build rather than
-# silently shipping a blank page.
-COPY patch-frontend.py /usr/local/bin/patch-frontend.py
-RUN python3 /usr/local/bin/patch-frontend.py /app
-
-# ---------------------------------------------------------------------------
 # Inventory
 # ---------------------------------------------------------------------------
 # This tag is opaque, six months old, and does NOT match upstream's main
@@ -221,6 +205,45 @@ RUN set -eux; \
 COPY enforce-model-policy.py /usr/local/bin/enforce-model-policy.py
 RUN ["python3", "/usr/local/bin/enforce-model-policy.py", "--apply"]
 RUN ["python3", "/usr/local/bin/enforce-model-policy.py", "--verify"]
+
+# Web UI
+# ---------------------------------------------------------------------------
+# The shipped frontend is a desktop-app build: it calls a hardcoded
+# http://127.0.0.1:17493 and references its assets with absolute paths. Served
+# from a server the browser is not sitting on, every API call goes to the
+# browser's own machine, and under ingress the assets 404 against the Home
+# Assistant origin. Neither the direct port nor ingress produces a working UI.
+#
+# patch-frontend.py rewrites both to be relative to wherever the page is
+# actually served from, gives the router the ingress base path, and adds a
+# server-side fallback so that RELOADING a route returns the app instead of a
+# 404. It verifies its own work and exits non-zero if the upstream bundle no
+# longer matches, so this fails the build rather than silently shipping a blank
+# page.
+#
+# ORDER MATTERS, and the build proves it. This step edits backend/main.py, so it
+# has to run AFTER the model policy: enforce-model-policy.py refuses to touch a
+# main.py whose SHA-256 has moved from the pristine upstream value, and putting
+# this first made the build fail with "main.py has changed upstream". Running it
+# afterwards instead means the recorded hash is re-sealed here, which
+# patch-frontend.py does explicitly and states in its output.
+COPY patch-frontend.py /usr/local/bin/patch-frontend.py
+RUN python3 /usr/local/bin/patch-frontend.py /app
+
+# Re-verify the model policy AFTER main.py was edited and the receipt re-sealed.
+# run.sh runs this same check at every boot, so without it here a bad re-seal
+# would build cleanly and only surface as an add-on that refuses to start.
+# Cheaper to find it in the build log.
+RUN ["python3", "/usr/local/bin/enforce-model-policy.py", "--verify"]
+
+# And prove it at RUNTIME, on the real app object. Both patchers assert their
+# own output through the AST, but an AST assertion cannot tell you that the
+# decorator ran - only that it is written down. This imports the doubly-patched
+# module and asserts the middleware is actually registered on app, which is the
+# one thing that makes reloads work. It is deliberately not a smoke test of the
+# whole server: it is the smallest check that fails if the patch is inert.
+COPY verify-runtime.py /usr/local/bin/verify-runtime.py
+RUN ["python3", "/usr/local/bin/verify-runtime.py"]
 
 COPY run.sh /run.sh
 RUN chmod +x /run.sh && sed -i 's/\r$//' /run.sh

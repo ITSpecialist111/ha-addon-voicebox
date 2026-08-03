@@ -248,7 +248,7 @@ ingress puts HA's login in front of it.
 ### The upstream UI is patched, because unpatched it cannot work here
 
 The frontend in the published image is built for a **desktop app**, and it shows
-in two ways. Both are fixed at build time by `patch-frontend.py`.
+in several ways. All are fixed at build time by `patch-frontend.py`.
 
 1. **Every API call went to a hardcoded `http://127.0.0.1:17493`.** In a desktop
    app that is correct — server and browser are the same machine. Served over a
@@ -261,14 +261,100 @@ in two ways. Both are fixed at build time by `patch-frontend.py`.
    Under ingress the app is served from a sub-path, so those requests hit Home
    Assistant's own root and 404 — producing a blank panel.
 
+3. **The router had no base path.** TanStack Router matched on the full
+   `location.pathname`, which under ingress starts with
+   `/api/hassio_ingress/<token>/`. Every route missed, so the panel rendered
+   the "not found" screen even though the assets had loaded.
+
+4. **Reloading a page broke the app.** The backend serves the SPA with
+   `StaticFiles(..., html=True)`, which returns `index.html` for `/` and
+   nothing else. Navigating inside the app never touches the server, so it
+   looked fine — until you pressed F5. `/models`, `/voices`, `/audio` and
+   `/server` returned a 404, and `/stories` returned **raw API JSON**, because
+   it collides with a real endpoint of the same name.
+
 The patch makes the asset paths relative and replaces the hardcoded origin with
 a base URL derived from `location.pathname` at load time. Under ingress that
 yields the ingress prefix; anywhere else it yields the empty string, meaning
 same-origin. One patch, both routes fixed.
 
+For the reload case it inserts an HTTP **middleware** into `main.py` that
+returns `index.html` for the client-side routes, but only when the request is a
+browser navigation — `Accept:` containing `text/html`. Two alternatives were
+tried and rejected on evidence:
+
+- *Static stub files* (`dist/models/index.html`). Starlette answers a directory
+  without a trailing slash with a **307 whose `Location` is rebuilt from the
+  proxied request**, losing the `/api/hassio_ingress/<token>` prefix. The
+  browser would be redirected out of the add-on entirely — worse than the 404.
+- *A FastAPI catch-all route.* `/stories` matches the real API endpoint first,
+  so a catch-all can never reach it. Only middleware runs before routing.
+
+Keying on `Accept` is safe here because the shipped bundle contains **zero**
+occurrences of `text/html` and sets no `Accept` header at all, so no API call
+the app makes can be intercepted. `GET /stories` from a script still returns
+the API; from the address bar it returns the app.
+
+The route list is extracted from the JS bundle at build time rather than
+hardcoded, so it cannot drift from what the app actually implements.
+
 It verifies itself during the build. If a future upstream image changes shape so
 that the patch no longer applies, **the build fails** rather than quietly
 shipping a blank page.
+
+#### And the backend is imported before the image is finished
+
+Two build steps rewrite `backend/main.py`, and both assert their own output by
+parsing it. That catches a patch that was *written* wrong. It cannot catch a
+patch that was written right and never *ran* - a decorator inside a branch that
+was not taken, an import that failed quietly, a module shadowed on `sys.path`.
+
+That distinction is not hypothetical here. This add-on has twice shipped a
+change that was present, inert, and reported success:
+
+- 0.4.0's `patch-backend.py` edited files that do not exist in the published
+  image and exited 0.
+- 0.7.0's model-policy verifier accepted `if False: _vb_enforce_model_size(...)`.
+
+So the build now ends with `verify-runtime.py`, which imports the patched
+backend and inspects the live `app.user_middleware` list. If the deep-link
+middleware is not actually registered, the **image fails to build** rather than
+the add-on failing to reload. The build sequence is:
+
+| step | what it proves |
+|---|---|
+| `enforce-model-policy.py --apply` | rewrites the 1.7B defaults |
+| `enforce-model-policy.py --verify` | the rewrite matches the receipt |
+| `patch-frontend.py` | frontend basepath + SPA fallback, re-seals the receipt |
+| `enforce-model-policy.py --verify` | the **re-seal** did not break the policy |
+| `verify-runtime.py` | the patched module imports and the middleware is live |
+
+The second `--verify` matters because `run.sh` runs that same check at every
+boot. Without it, a bad re-seal builds cleanly and then fails every single
+start - the most expensive place to find it. `check-consistency.py` asserts
+this ordering statically, and each of those guards is itself mutation-tested.
+
+## Build order: the model policy must run first
+
+Two build steps edit `backend/main.py`, and the order between them is
+load-bearing:
+
+1. `enforce-model-policy.py --apply` (the 1.7B OOM guard)
+2. `patch-frontend.py` (the deep-link fallback)
+
+`enforce-model-policy.py` pins a SHA-256 of pristine upstream `main.py` and
+refuses to patch a file that has already moved — a deliberate tripwire, because
+a model-size patch that silently stops applying is exactly how this host got
+OOM-killed twice. Running `patch-frontend.py` first therefore **fails the
+build** with *"main.py has changed upstream"*.
+
+Running it second means the hash the policy recorded no longer matches, and
+`run.sh` re-verifies that hash on **every start** — so the failure would move
+from build time to every boot. `patch-frontend.py` therefore re-seals just the
+`main.py` entry in `/app/.voicebox-model-policy.json` and says so in its output.
+Only the hash moves: the verifier still re-parses `main.py`'s AST and executes
+the policy block out of `pytorch_backend.py`, so a guard that had been removed
+or neutered is still caught. `check-consistency.py` asserts the ordering.
 
 ## Security
 
