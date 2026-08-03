@@ -139,6 +139,7 @@ RE_SPA_MOUNT = re.compile(
     re.MULTILINE,
 )
 SPA_FALLBACK_MARKER = "_vb_spa_deep_links"
+CACHE_MARKER = "_vb_no_stale_frontend"
 
 # enforce-model-policy.py records a hash of every file it patched, and run.sh
 # re-checks those hashes on EVERY start - that is what makes a tampered image
@@ -173,6 +174,37 @@ SPA_FALLBACK = '''
 {i}    ):
 {i}        return FileResponse(_VB_SPA_INDEX, media_type="text/html")
 {i}    return await call_next(request)
+
+{i}# --- Home Assistant ingress cache control (added by patch-frontend.py) ---
+{i}# The static file server sends no Cache-Control at all - only ETag and
+{i}# Last-Modified - so a browser applies HEURISTIC freshness and may reuse a
+{i}# previously stored bundle WITHOUT revalidating it. The bundle filename comes
+{i}# from the upstream build and does not change when this add-on is updated, so
+{i}# the stale copy is served under the very same URL as the new one: an updated
+{i}# add-on then renders the PREVIOUS frontend, and if that copy predates the
+{i}# ingress patches it renders nothing at all.
+{i}#
+{i}# HTTP caches are keyed by origin, so this appears as "works on the LAN
+{i}# address but blank through the external hostname" - the two origins simply
+{i}# hold different cached copies. No amount of server-side testing can see it,
+{i}# because the browser never sends the request.
+{i}#
+{i}# no-cache does NOT mean do-not-store: the file is still cached, the browser
+{i}# just has to revalidate it, and the ETag above answers that with a 304 and no
+{i}# body. The cost is one conditional request per asset per load.
+{i}_VB_NO_CACHE_PATHS = frozenset(("/", "/index.html"))
+
+{i}@app.middleware("http")
+{i}async def _vb_no_stale_frontend(request, call_next):
+{i}    response = await call_next(request)
+{i}    _vb_path = request.url.path
+{i}    if (
+{i}        _vb_path in _VB_NO_CACHE_PATHS
+{i}        or _vb_path.startswith("/assets/")
+{i}        or _vb_path.rstrip("/") in _VB_SPA_ROUTES
+{i}    ):
+{i}        response.headers["Cache-Control"] = "no-cache"
+{i}    return response
 '''
 
 SKIP_DIRS = {"node_modules", ".git", "site-packages", "__pycache__", "dist-info"}
@@ -367,6 +399,98 @@ def assert_live_middleware(source: str, routes: tuple[str, ...]) -> None:
             "the deep-link fallback's route set does not cover "
             + ", ".join(missing)
             + " - reloading those would still lose the app"
+        )
+
+    assert_live_cache_middleware(tree)
+
+
+def assert_live_cache_middleware(tree: "ast.Module") -> None:
+    """Assert the no-stale-frontend middleware is registered and does its job.
+
+    Held to the same standard as the deep-link fallback, and for the same
+    reason: a patch that is present but inert reports success and ships a bug.
+    Here the bug is invisible from the server side - the browser simply never
+    asks - so nothing downstream would catch it.
+    """
+    fn = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.AsyncFunctionDef)
+                and node.name == CACHE_MARKER):
+            fn = node
+            break
+    if fn is None:
+        raise PatchError(
+            f"main.py has no async {CACHE_MARKER}, so index.html would be "
+            "served with no Cache-Control and a browser could keep reusing a "
+            "previous build's bundle"
+        )
+
+    if not any(
+        isinstance(d, ast.Call)
+        and isinstance(d.func, ast.Attribute)
+        and d.func.attr == "middleware"
+        and isinstance(d.func.value, ast.Name)
+        and d.func.value.id == "app"
+        and [a for a in d.args
+             if isinstance(a, ast.Constant) and a.value == "http"]
+        for d in fn.decorator_list
+    ):
+        raise PatchError(
+            f"{CACHE_MARKER} is defined but not registered with "
+            '@app.middleware("http"), so no response ever gets a Cache-Control '
+            "header"
+        )
+
+    guard = next((n for n in fn.body if isinstance(n, ast.If)), None)
+    if guard is None:
+        raise PatchError(
+            f"{CACHE_MARKER} has no guard, so it would mark every response "
+            "no-cache, including the generated audio it is not about"
+        )
+    if isinstance(guard.test, ast.Constant):
+        raise PatchError(
+            f"{CACHE_MARKER}'s guard is the constant {guard.test.value!r}, "
+            "so it is inert (or applies to everything)"
+        )
+    for node in ast.walk(guard.test):
+        if isinstance(node, ast.BoolOp):
+            for operand in node.values:
+                if isinstance(operand, ast.Constant):
+                    raise PatchError(
+                        f"{CACHE_MARKER}'s guard short-circuits on the "
+                        f"constant {operand.value!r}, so the header is never "
+                        "set where it matters"
+                    )
+
+    # Present, decorated and guarded is still not the same as effective: the
+    # body has to actually write the header. Assert the assignment itself.
+    set_header = [
+        n for n in ast.walk(guard)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Subscript)
+            and isinstance(t.slice, ast.Constant)
+            and isinstance(t.slice.value, str)
+            and t.slice.value.lower() == "cache-control"
+            for t in n.targets
+        )
+    ]
+    if not set_header:
+        raise PatchError(
+            f"{CACHE_MARKER} matches, but never assigns a Cache-Control "
+            "header, so a stale bundle can still be reused without "
+            "revalidating"
+        )
+    if not any(
+        isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+        and "no-cache" in n.value.value
+        for n in set_header
+    ):
+        raise PatchError(
+            f"{CACHE_MARKER} sets Cache-Control to something that does not "
+            "include no-cache, so the browser is still free to reuse a stored "
+            "bundle without revalidating it"
         )
 
 

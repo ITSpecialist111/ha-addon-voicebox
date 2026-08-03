@@ -504,6 +504,47 @@ A quick way to tell the two failure modes apart in the browser console:
 
 Rebuilding the add-on re-applies the patch.
 
+### Blank on one address but fine on another (fixed in 0.7.5)
+
+The classic report: the panel works on `http://<ip>:8123` but is blank through
+an external hostname, or vice versa — and *nothing* on the server side can be
+made to reproduce it.
+
+That asymmetry is the diagnosis. **HTTP caches are keyed by origin**, so the two
+addresses hold entirely separate copies of the frontend.
+
+Upstream serves the bundle with an `ETag` and a `Last-Modified` but **no
+`Cache-Control` at all**. RFC 9111 then permits a browser to apply *heuristic*
+freshness — roughly 10% of the age of the file — and reuse its stored copy
+**without revalidating**. Worse, the bundle filename comes from the upstream
+Vite build (`assets/index-<hash>.js`) and does **not change when this add-on is
+updated**, so the stale copy sits at exactly the same URL as the new one.
+
+An add-on update therefore leaves one origin still running the *previous*
+frontend. If that copy predates the ingress patches above, its router has no
+basepath, matches nothing under `/api/hassio_ingress/<token>/`, and renders
+**nothing at all** — a white panel, no error, no failed request in the network
+tab, because the browser never asked the server for anything.
+
+`patch-frontend.py` now adds a second middleware, `_vb_no_stale_frontend`, that
+sends `Cache-Control: no-cache` on `/`, `/index.html`, `/assets/*` and every SPA
+route.
+
+`no-cache` does **not** mean "do not store". The file is still cached; the
+browser simply has to revalidate it, and the `ETag` upstream already sends
+answers that with a **304 and no body**. The cost is one conditional request per
+asset per load. The alternative — content-hashing the filenames — would have
+risked a 404 (and the same blank page) for any browser still holding an
+`index.html` that referenced the old name.
+
+**If you are on a version before 0.7.5, or you updated from one:** force a
+reload once — `Ctrl` + `Shift` + `R` (`Cmd` + `Shift` + `R` on macOS) — on each
+address you use. After 0.7.5 this stops recurring.
+
+The middleware is scoped deliberately: generated audio is large and immutable,
+so it is left cacheable. Marking it `no-cache` would re-download every clip on
+every replay.
+
 ### The UI loads but the History view is blank or errors
 
 Fixed in 0.6.1. Upstream's `GET /history` declares `limit: int = 50` with no

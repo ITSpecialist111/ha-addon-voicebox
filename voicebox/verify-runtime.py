@@ -28,6 +28,7 @@ import tempfile
 # run this against a fixture, so the check is exercised rather than trusted.
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "/app"
 NAME = "_vb_spa_deep_links"
+CACHE = "_vb_no_stale_frontend"
 
 
 def fail(msg: str) -> "typing.NoReturn":  # noqa: F821
@@ -70,6 +71,34 @@ if NAME not in registered:
         "lose the app. This is the 'present but inert' failure again."
     )
 
+if CACHE not in registered:
+    fail(
+        f"{CACHE} is NOT registered on the app.\n"
+        f"  middleware actually registered: {registered or '(none)'}\n"
+        "index.html would be served with no Cache-Control, so a browser could\n"
+        "keep reusing a previous build's bundle under the same URL and render\n"
+        "the old frontend - or nothing at all."
+    )
+
+# Registration order decides nesting. Starlette INSERTS each new middleware at
+# position 0, and index 0 is the outermost - verified by experiment, because
+# getting this backwards is easy and silent:
+#
+#   register first, then second -> ['second', 'first'], and 'first' runs inner
+#
+# The cache middleware has to be outside the deep-link one, or the index.html
+# that a reload returns bypasses it and goes out with no Cache-Control after
+# all - which is the exact bug this is here to prevent.
+if registered.index(CACHE) >= registered.index(NAME):
+    fail(
+        f"{CACHE} is at index {registered.index(CACHE)} and {NAME} at "
+        f"{registered.index(NAME)}.\n"
+        f"  order (index 0 is outermost): {registered}\n"
+        f"{CACHE} must wrap {NAME}, otherwise a deep-link reload returns\n"
+        "index.html without a Cache-Control header and the stale-bundle bug\n"
+        "comes straight back on exactly the routes it broke before."
+    )
+
 routes = getattr(main, "_VB_SPA_ROUTES", None)
 if not routes:
     fail(
@@ -78,4 +107,4 @@ if not routes:
     )
 
 shutil.rmtree(_scratch, ignore_errors=True)
-print(f"runtime check: {NAME} registered, covering {sorted(routes)}")
+print(f"runtime check: {NAME} + {CACHE} registered, covering {sorted(routes)}")

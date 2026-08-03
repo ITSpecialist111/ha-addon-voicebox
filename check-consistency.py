@@ -218,4 +218,29 @@ report(pathlib.Path("voicebox/verify-runtime.py").is_file(),
        "verify-runtime.py present",
        "voicebox/verify-runtime.py is missing - the Dockerfile COPY will fail")
 
+# The two files name the cache middleware independently: patch-frontend.py
+# EMITS it, verify-runtime.py LOOKS FOR it. Rename one and the build fails
+# loudly, which is survivable - but it fails at image-build time, minutes in,
+# with a message about a missing middleware rather than a typo. Catch it here
+# in milliseconds instead.
+_pf = pathlib.Path("voicebox/patch-frontend.py").read_text(encoding="utf-8")
+_vr = pathlib.Path("voicebox/verify-runtime.py").read_text(encoding="utf-8")
+_emitted = re.search(r'^CACHE_MARKER = "([^"]+)"', _pf, re.M)
+_sought = re.search(r'^CACHE = "([^"]+)"', _vr, re.M)
+if not _emitted or not _sought:
+    report(False, "",
+           "cannot find CACHE_MARKER in patch-frontend.py or CACHE in "
+           "verify-runtime.py - the stale-frontend check has lost its name")
+else:
+    report(_emitted.group(1) == _sought.group(1),
+           "the cache middleware has the same name in patcher and verifier",
+           f"patch-frontend.py emits {_emitted.group(1)!r} but "
+           f"verify-runtime.py looks for {_sought.group(1)!r}, so the build "
+           "fails on a name mismatch rather than a real problem")
+    report(f"async def {_emitted.group(1)}" in _pf,
+           "...and the patcher really emits it as an async function",
+           f"patch-frontend.py names {_emitted.group(1)!r} but never emits "
+           "`async def` for it, so no Cache-Control header is ever set and a "
+           "browser can keep serving a previous build's bundle")
+
 sys.exit(rc)

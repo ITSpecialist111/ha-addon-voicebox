@@ -126,6 +126,11 @@ RE_FALLBACK_BLOCK = re.compile(
     re.DOTALL,
 )
 RE_GUARD = re.compile(r"^[ \t]*if \($", re.MULTILINE)
+RE_CACHE_BLOCK = re.compile(
+    r"[ \t]*# --- Home Assistant ingress cache control.*?"
+    r'response\.headers\["Cache-Control"\] = "no-cache"\n',
+    re.DOTALL,
+)
 RE_ROUTESET = re.compile(r"^[ \t]*_VB_SPA_ROUTES = frozenset\(.*\)$",
                          re.MULTILINE)
 
@@ -216,6 +221,7 @@ with TestClient(main.app) as c:
             "is_app": '<div id="root">' in r.text,
             "body": r.text[:200],
             "location": r.headers.get("location"),
+            "cache": r.headers.get("cache-control"),
         }
 print(json.dumps(out))
 '''
@@ -719,6 +725,26 @@ def main() -> int:
                 check("assets are untouched",
                       a["status"] == 200 and not a["is_app"], repr(a)[:160])
 
+                # The stale-bundle defect. Upstream serves the frontend with an
+                # ETag but NO Cache-Control, so a browser is free to apply
+                # heuristic freshness and reuse a stored copy without asking.
+                # The bundle filename never changes between add-on versions, so
+                # the stale copy sits at the very same URL as the new one and an
+                # updated add-on renders the PREVIOUS frontend - or, if that one
+                # predates the ingress patches, nothing at all. Caches are keyed
+                # by ORIGIN, which is why it showed up as "fine on the LAN
+                # address, blank through the external hostname".
+                check("/ is served no-cache so a new build is picked up",
+                      rt["cache"] == "no-cache", repr(rt["cache"]))
+                check("...and so are the hashed assets",
+                      a["cache"] == "no-cache", repr(a["cache"]))
+                check("...and the deep-link reloads that return index.html",
+                      m["cache"] == "no-cache", repr(m["cache"]))
+                # Scope matters: generated audio is large and immutable, and
+                # marking it no-cache would re-download it on every replay.
+                check("but the API is left alone",
+                      h["cache"] != "no-cache", repr(h["cache"]))
+
     # ------------------------------------------------------------------
     # 23. the two main.py patchers, in Dockerfile order, on the real source
     #
@@ -844,6 +870,30 @@ def main() -> int:
              "            pass")),
         ("a route was dropped from the set",
          lambda t: t.replace("'/models', ", "")),
+        # The cache middleware gets the same treatment. Every one of these
+        # leaves the marker in the file and the add-on working, and every one
+        # brings the stale-bundle bug back.
+        ("the cache middleware is only a comment",
+         lambda t: RE_CACHE_BLOCK.sub(
+             "        # _vb_no_stale_frontend: removed\n", t)),
+        ("the cache guard was ORed with a constant",
+         lambda t: t.replace('_vb_path in _VB_NO_CACHE_PATHS',
+                             'False or _vb_path in _VB_NO_CACHE_PATHS')),
+        ("the cache guard is a constant",
+         lambda t: t.replace(
+             "        _vb_path = request.url.path\n        if (",
+             "        _vb_path = request.url.path\n        if False and (")),
+        ("it matches, but never sets the header",
+         lambda t: t.replace(
+             '            response.headers["Cache-Control"] = "no-cache"',
+             "            pass")),
+        ("the header is set to something that still allows reuse",
+         lambda t: t.replace('= "no-cache"', '= "public, max-age=31536000"')),
+        ("the cache middleware is defined but never registered",
+         lambda t: t.replace(
+             '    @app.middleware("http")\n'
+             "    async def _vb_no_stale_frontend",
+             "    async def _vb_no_stale_frontend")),
     ]
     for title, mutate in MUTATIONS:
         with tempfile.TemporaryDirectory() as td:
