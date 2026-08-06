@@ -115,6 +115,75 @@ SSE_BASE_MARKER = '${window.__VB_BASE__||""}/models/progress/'
 RE_DEFAULT_ORIGIN = re.compile(r'"http://127\.0\.0\.1:17493"')
 DEFAULT_ORIGIN_PATCHED = '(window.__VB_BASE__||location.origin)'
 
+# The live microphone waveform shown behind the "Start Recording" button. It
+# calls getUserMedia with no guard at all, inside a useEffect:
+#
+#   let m=null;return navigator.mediaDevices.getUserMedia({audio:!0,video:!1})
+#     .then(...).catch(v=>{console.warn("Could not access microphone ...",v)})
+#
+# The .catch() only handles a REJECTED promise. navigator.mediaDevices is
+# [SecureContext] in the spec, so over plain http:// it is not merely falsy - the
+# property does not exist - and the call throws a synchronous TypeError before
+# any promise is created. Nothing catches it, it escapes the effect, and React
+# unmounts the tree: the whole panel becomes "Something went wrong! Cannot read
+# properties of undefined (reading 'getUserMedia')" the instant the dialog opens,
+# before the user has clicked anything.
+#
+# Home Assistant is commonly reached over http:// on a LAN address, and a private
+# IP is NOT a secure context (that proposal was never shipped), so this is the
+# normal case here rather than an edge case.
+#
+# The record button itself already handles this properly - it checks
+# mediaDevices, waits, re-checks, and shows "Microphone access is not available.
+# ... ensure you are using a secure context (HTTPS or localhost)". So guarding
+# the waveform is enough to turn a dead panel into a working one that explains
+# itself when you press record.
+RE_MIC_PREVIEW = re.compile(
+    r"let ([A-Za-z_$][A-Za-z0-9_$]*)=null;return navigator\.mediaDevices"
+    r"\.getUserMedia\(\{audio:!0,video:!1\}\)"
+)
+MIC_PREVIEW_PATCHED = (
+    r'let \g<1>=null;if(!navigator.mediaDevices||!navigator.mediaDevices'
+    r'.getUserMedia){console.warn("Voicebox: no microphone API - this page is '
+    r'not a secure context (needs https:// or localhost). Waveform preview '
+    r'disabled.");return}return navigator.mediaDevices'
+    r".getUserMedia({audio:!0,video:!1})"
+)
+
+# The POSITIVE half of the check. RE_MIC_PREVIEW going quiet only proves that
+# SOMETHING was inserted before the call - not that what was inserted can ever
+# fire. A review caught exactly that: mutating the emitted guard to
+# `if(false&&...)` left the marker in place, the count correct, verify() passing
+# and the crash fully reintroduced. That is the third time this project has been
+# one assertion away from shipping a patch that reports success while doing
+# nothing, so the guard is now asserted by shape, not by presence.
+#
+# Deliberately spelled with regex escaping (\(, \., \|) so that it shares no
+# literal text with MIC_PREVIEW_PATCHED above. A mutation to one therefore
+# cannot silently mutate the other - which is the entire point of a cross-check.
+RE_MIC_GUARDED = re.compile(
+    r"let ([A-Za-z_$][A-Za-z0-9_$]*)=null;"
+    r"if\(!navigator\.mediaDevices\|\|!navigator\.mediaDevices\.getUserMedia\)\{"
+    # ...and it must BAIL OUT UNCONDITIONALLY.
+    #
+    # This part has been wrong twice, and both versions accepted a guard that
+    # still crashed:
+    #
+    #   [^{}]*\}         accepted a body that only warns and falls straight
+    #                    through to the very call it was meant to prevent.
+    #   [^{}]*return\}   accepted `...;if(0)return}` - a return that never runs -
+    #                    and, because it only looked for the WORD, also accepted
+    #                    the word "return" sitting inside the warning string.
+    #
+    # Both were confirmed by execution to reintroduce the exact reported error,
+    # so the body is now matched by shape: a single console.warn call, then a
+    # bare return, and nothing else. Anything more elaborate is not something
+    # this patcher emits, and refusing it costs only a deliberate edit here.
+    r"console\.warn\((?:[^()]|\([^()]*\))*\);return\}"
+    r"return navigator\.mediaDevices\.getUserMedia"
+)
+MIC_PREVIEW_MARKER = "Waveform preview disabled."
+
 # Client-side routes. Navigating to one never touches the server - TanStack
 # pushes history - but RELOADING one does, and then the app disappears: /models
 # has no API route and 404s, while /stories has one and answers raw JSON.
@@ -674,6 +743,7 @@ def patch_bundles(assets: pathlib.Path) -> list[str]:
     router_sites = 0
     js_assets = 0
     sse = 0
+    mic = 0
 
     for js in sorted(assets.glob("*.js")):
         original = js.read_text(encoding="utf-8")
@@ -694,6 +764,14 @@ def patch_bundles(assets: pathlib.Path) -> list[str]:
             if n_router:
                 routers += n_router
                 notes.append(f"{js.name}: gave {n_router} router(s) an ingress basepath")
+
+        text, n_mic = RE_MIC_PREVIEW.subn(MIC_PREVIEW_PATCHED, text)
+        if n_mic:
+            mic += n_mic
+            notes.append(
+                f"{js.name}: guarded {n_mic} microphone preview call(s) "
+                "against a non-secure context"
+            )
 
         text, n_asset = RE_ABS_ASSET_JS.subn(ABS_ASSET_JS_PATCHED, text)
         if n_asset:
@@ -747,6 +825,29 @@ def patch_bundles(assets: pathlib.Path) -> list[str]:
         ):
             notes.append("absolute /assets/ URLs already rebased")
 
+    # Fail closed, like the router above. If upstream reshapes this call the
+    # panel goes back to crashing on open over http, and the only symptom is an
+    # opaque "Something went wrong!" - so stop the build and re-check by hand
+    # rather than ship a UI that dies on the address most people use.
+    if mic == 0:
+        # Checked by shape, not by marker: the console message survives a
+        # mutation that neuters the condition it sits inside.
+        already = any(
+            RE_MIC_GUARDED.search(js.read_text(encoding="utf-8"))
+            for js in assets.glob("*.js")
+        )
+        if already:
+            notes.append("microphone preview already guarded")
+        else:
+            raise PatchError(
+                f"no unguarded microphone preview found in {assets}. Either "
+                "upstream fixed it - in which case drop RE_MIC_PREVIEW - or the "
+                "bundle changed shape and the guard no longer applies. Left "
+                "unpatched, opening the voice-creation dialog over http:// "
+                "crashes the whole panel with 'Cannot read properties of "
+                "undefined (reading getUserMedia)'."
+            )
+
     return notes
 
 
@@ -763,6 +864,16 @@ def verify(frontend: pathlib.Path, root: pathlib.Path) -> None:
         for js in assets.glob("*.js")
     ):
         raise PatchError("no bundle contains the patched getBaseUrl()")
+    if not any(
+        RE_MIC_GUARDED.search(js.read_text(encoding="utf-8"))
+        for js in assets.glob("*.js")
+    ):
+        raise PatchError(
+            "no bundle contains a working microphone guard. Something was "
+            "written in front of the getUserMedia call, but it does not have "
+            "the shape of a guard that can actually fire - so the voice dialog "
+            "would still crash the whole panel over http://"
+        )
     for js in assets.glob("*.js"):
         text = js.read_text(encoding="utf-8")
         if RE_GET_BASE_URL.search(text):
@@ -776,6 +887,13 @@ def verify(frontend: pathlib.Path, root: pathlib.Path) -> None:
             raise PatchError(
                 f"{js.name} still contains an absolute /assets/ URL, which "
                 "resolves against Home Assistant rather than the add-on"
+            )
+        if RE_MIC_PREVIEW.search(text):
+            raise PatchError(
+                f"{js.name} still dereferences navigator.mediaDevices without "
+                "a guard. Over http:// that property does not exist, so opening "
+                "the voice-creation dialog throws a synchronous TypeError that "
+                "no .catch() sees and the entire panel dies"
             )
         if RE_SSE_BASE.search(text):
             raise PatchError(

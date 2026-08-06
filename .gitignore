@@ -5,3 +5,11 @@
 
 __pycache__/
 *.pyc
+
+# Copies of upstream's built frontend bundle, produced while developing
+# the patch regexes. Same reasoning as .imgsrc above: derived from the
+# pinned upstream image, not ours to redistribute, and ~1MB each.
+_*.js
+
+# Throwaway probes and one-off patch scripts.
+.vb*

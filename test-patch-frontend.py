@@ -55,6 +55,60 @@ REAL_ROUTES_JS = (
     "component:WZ});"
 )
 
+# The live-waveform effect, verbatim in shape from the bundle. Note the .catch():
+# it looks like this code handles a missing microphone, and that is exactly why
+# the bug survived - a rejected promise IS handled, but navigator.mediaDevices
+# being ABSENT throws synchronously, before any promise exists, so nothing here
+# ever sees it.
+REAL_MIC_JS = (
+    "p.useEffect(()=>{if(!d)return;let m=null;"
+    "return navigator.mediaDevices.getUserMedia({audio:!0,video:!1})"
+    ".then(v=>{m=v,h(v)})"
+    '.catch(v=>{console.warn("Could not access microphone for visualization:",v)}),'
+    "()=>{m&&m.getTracks().forEach(v=>{v.stop()})}},[d]);"
+)
+
+# A microphone preview, for fixtures that supply their own JS.
+MIC_JS = REAL_MIC_JS
+
+
+# Extracts the waveform effect from a bundle and runs it, rather than re-typing
+# an approximation of it: the point is to exercise the shipped bytes.
+HARNESS_JS = r"""
+const fs = require("fs"), path = require("path");
+const dir = process.argv[2];
+function body(src) {
+  const i = src.indexOf("if(!d)return;let ");
+  if (i < 0) throw new Error("effect not found");
+  let depth = 0, j = i;
+  for (; j < src.length; j++) {
+    const c = src[j];
+    if (c === "{") depth++;
+    else if (c === "}") { if (depth === 0) break; depth--; }
+  }
+  return src.slice(i, j);
+}
+const out = [];
+for (const which of ["before", "after"]) {
+  const b = body(fs.readFileSync(path.join(dir, which + ".js"), "utf8"));
+  for (const [ctx, nav] of [
+    ["http", {}],
+    ["https", { mediaDevices: { getUserMedia: () =>
+        Promise.resolve({ getTracks: () => [] }) } }],
+  ]) {
+    try {
+      const ret = new Function("d", "h", "navigator", "console", b)(
+        true, () => {}, nav, { warn() {} });
+      out.push(which + "/" + ctx + "=OK");
+      out.push(which + "/" + ctx + "/ret=" + typeof ret);
+    } catch (e) {
+      out.push(which + "/" + ctx + "=THREW " + e.message);
+    }
+  }
+}
+console.log(out.join("\n"));
+"""
+
 # Verbatim from the container: the whole block that serves the built SPA.
 REAL_MAIN_PY = '''from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
@@ -110,6 +164,7 @@ REAL_JS = (
     'const h=`${i}/models/progress/${e}`;'
     'if(!o||!n)return;const u=new EventSource(`${o}/models/progress/${e}`);'
     + REAL_ROUTES_JS
+    + REAL_MIC_JS
 )
 
 # A router construction, for fixtures that supply their own JS.
@@ -358,7 +413,7 @@ def main() -> int:
     scenario("8. Whitespace variants of getBaseUrl still match")
     with tempfile.TemporaryDirectory() as td:
         spaced = ("class A { getBaseUrl() { return store.getState().serverUrl } }"
-                  + ROUTER_JS + REAL_ROUTES_JS)
+                  + ROUTER_JS + REAL_ROUTES_JS + MIC_JS)
         root = make_fixture(pathlib.Path(td), js=spaced)
         r = run(root)
         js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
@@ -1034,6 +1089,194 @@ def main() -> int:
             r = run_runtime(root)
             check("a missing web/dist is caught, not silently unmounted",
                   r.returncode != 0, (r.stdout + r.stderr)[-300:])
+
+    # ------------------------------------------------------------------
+    # 26. the microphone guard
+    #
+    # Reported symptom: clicking "Create Voice" replaced the whole panel with
+    # "Something went wrong! Cannot read properties of undefined (reading
+    # 'getUserMedia')". Not the record button - the live waveform behind it,
+    # which runs on mount.
+    #
+    # navigator.mediaDevices is [SecureContext]. Over http:// the property does
+    # not exist, so the call throws a synchronous TypeError. The upstream
+    # .catch() only sees REJECTED PROMISES, so the throw escapes the effect and
+    # React unmounts the tree. Home Assistant is normally reached over http on a
+    # LAN address, and a private IP is not a secure context, so this is the
+    # common case rather than an edge one.
+    # ------------------------------------------------------------------
+    scenario("26. the microphone preview cannot crash the panel")
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td))
+        r = run(root)
+        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        check("exits 0", r.returncode == 0, r.stderr)
+        check("says what it guarded",
+              "microphone preview" in r.stdout, r.stdout[-300:])
+        check("the bare dereference is gone",
+              "let m=null;return navigator.mediaDevices.getUserMedia" not in js)
+        check("a guard now precedes the call",
+              "if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)" in js)
+        check("the guard returns before the call",
+              js.index("if(!navigator.mediaDevices")
+              < js.index("return navigator.mediaDevices.getUserMedia"))
+        check("it explains itself in the console",
+              "not a secure context" in js)
+        # The happy path must be untouched: on https the stream is still
+        # requested, still stored, and the tracks are still stopped on unmount.
+        check("the real call survives",
+              "navigator.mediaDevices.getUserMedia({audio:!0,video:!1})" in js)
+        check("the stream is still stored", ".then(v=>{m=v,h(v)})" in js)
+        check("the original catch survives",
+              "Could not access microphone for visualization:" in js)
+        check("the cleanup still stops tracks",
+              "m&&m.getTracks().forEach(v=>{v.stop()})" in js)
+
+        # Braces must balance across the inserted block, or the bundle is not
+        # parseable JavaScript and NOTHING renders - a far worse failure than
+        # the one being fixed.
+        seg_start = js.index("if(!navigator.mediaDevices")
+        seg = js[seg_start:js.index("return navigator.mediaDevices.getUserMedia")]
+        check("the inserted block balances its braces",
+              seg.count("{") == seg.count("}"), seg)
+        check("the inserted block balances its parens",
+              seg.count("(") == seg.count(")"), seg)
+
+    with tempfile.TemporaryDirectory() as td:
+        # Idempotency: the patcher runs again on every build, and a second guard
+        # wrapped around the first would be harmless but is a sign the regex no
+        # longer describes what is in the file.
+        root = make_fixture(pathlib.Path(td))
+        run(root)
+        first = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        r = run(root)
+        again = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        check("a second run exits 0", r.returncode == 0, r.stderr)
+        check("says it was already guarded",
+              "already guarded" in r.stdout, r.stdout[-300:])
+        check("the bundle is byte-identical", first == again)
+        check("there is exactly one guard",
+              again.count("if(!navigator.mediaDevices||") == 1)
+
+    with tempfile.TemporaryDirectory() as td:
+        # Fail closed. If upstream restructures this effect the regex stops
+        # matching, and a silent no-op ships a UI that dies on open. The only
+        # symptom is an opaque "Something went wrong!", so the build must stop.
+        root = make_fixture(
+            pathlib.Path(td),
+            js=REAL_JS.replace(REAL_MIC_JS, "p.useEffect(()=>{if(!d)return},[d]);"),
+        )
+        r = run(root)
+        check("a bundle with no recognisable preview fails the build",
+              r.returncode != 0, (r.stdout + r.stderr)[-300:])
+        check("...and names the symptom it would have shipped",
+              "getUserMedia" in r.stderr, r.stderr[-400:])
+        check("...and says what to do about it",
+              "RE_MIC_PREVIEW" in r.stderr, r.stderr[-400:])
+
+    # A patcher that "succeeds" while leaving the crash in place must be caught
+    # by the build, not by a human noticing a dead panel weeks later. Each
+    # mutation below leaves RE_MIC_PREVIEW unable to match - so the NEGATIVE
+    # check alone reports success - while reintroducing the bug completely.
+    #
+    # The first of these was written as `returncode != 0 or "if(false&&" in js`
+    # and a review pointed out that the right-hand side is true by construction:
+    # the assertion could not fail, and it was quietly documenting that the
+    # mutant SURVIVED. It really did survive, all the way through verify(). That
+    # is what motivated the positive RE_MIC_GUARDED assertion; these now assert
+    # a non-zero exit and nothing else.
+    # Targets must be CONTIGUOUS in the source. MIC_PREVIEW_PATCHED is built by
+    # joining several r'...' literals, so a string that reads as one piece in
+    # the emitted JavaScript can be split across a line break in the file - two
+    # of these were originally written that way and matched nothing at all,
+    # which the "appears exactly once" check below is here to catch.
+    MIC_MUTATIONS = [
+        ("the guard is ANDed with a constant",
+         "if(!navigator.mediaDevices||", "if(false&&"),
+        ("the guard tests something unrelated",
+         "!navigator.mediaDevices||!navigator.mediaDevices",
+         "window.__vb_never&&window.__vb_never"),
+        ("the guard warns but never bails out",
+         'disabled.");return}', 'disabled.");}'),
+        # Found by attacking the positive regex rather than by writing a test
+        # for behaviour already believed correct. Both of these were ACCEPTED by
+        # earlier versions of RE_MIC_GUARDED, and both were then confirmed by
+        # execution to reproduce the exact reported crash. A regex that merely
+        # looks for the WORD "return" somewhere in the body is not enough.
+        ("the bail-out is inside a branch that never runs",
+         'disabled.");return}', 'disabled.");if(0)return}'),
+        ("the word return only appears inside the message",
+         'disabled.");return}', 'disabled. no return}'),
+    ]
+    src = SCRIPT.read_text(encoding="utf-8")
+    for label, frm, to in MIC_MUTATIONS:
+        # The mutation must be unambiguous, or it might be editing the comment
+        # or the positive regex rather than the emitted template.
+        check(f"[{label}] the target appears exactly once",
+              src.count(frm) == 1, f"count={src.count(frm)}")
+        with tempfile.TemporaryDirectory() as td:
+            root = make_fixture(pathlib.Path(td))
+            broken = src.replace(frm, to, 1)
+            check(f"[{label}] the mutated patcher really differs", broken != src)
+            mutant = pathlib.Path(td) / "mutant.py"
+            mutant.write_text(broken, encoding="utf-8")
+            r = subprocess.run([sys.executable, str(mutant), str(root)],
+                               capture_output=True, text=True)
+            check(f"[{label}] the build fails", r.returncode != 0,
+                  (r.stdout + r.stderr)[-300:])
+            check(f"[{label}] ...and says the guard cannot fire",
+                  "microphone guard" in r.stderr or "still dereferences" in r.stderr,
+                  r.stderr[-300:])
+
+    # ------------------------------------------------------------------
+    # 27. the guarded effect is EXECUTED, not just pattern-matched
+    #
+    # Every assertion above is a string search over text the patcher itself
+    # emitted. None of them proves the emitted JavaScript actually behaves. The
+    # bug being fixed was precisely a semantic one - code that LOOKS like it
+    # handles a missing microphone (it has a .catch()) but does not, because the
+    # throw is synchronous - so pattern-matching is the wrong instrument.
+    #
+    # This runs the real effect body out of the fixture bundle under two
+    # navigators: one with no mediaDevices (plain http) and one with it (https).
+    # ------------------------------------------------------------------
+    scenario("27. the guarded effect really survives a missing microphone")
+    node = shutil.which("node")
+    if not node:
+        skip("node is not installed, so the emitted JavaScript is never run")
+    else:
+        with tempfile.TemporaryDirectory() as td:
+            root = make_fixture(pathlib.Path(td))
+            before = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(
+                encoding="utf-8")
+            r = run(root)
+            check("exits 0", r.returncode == 0, r.stderr)
+            after = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(
+                encoding="utf-8")
+
+            harness = pathlib.Path(td) / "harness.js"
+            harness.write_text(HARNESS_JS, encoding="utf-8")
+            (pathlib.Path(td) / "before.js").write_text(before, encoding="utf-8")
+            (pathlib.Path(td) / "after.js").write_text(after, encoding="utf-8")
+            p = subprocess.run([node, str(harness), td],
+                               capture_output=True, text=True)
+            out = p.stdout
+            check("the harness ran", p.returncode == 0 or out, p.stderr[-400:])
+            # The bug must be REPRODUCED first, or the fix proves nothing.
+            check("unpatched really does throw over http",
+                  "before/http=THREW" in out, out)
+            check("...with the exact reported message",
+                  "reading 'getUserMedia'" in out, out)
+            check("patched does NOT throw over http",
+                  "after/http=OK" in out, out)
+            check("unpatched works over https", "before/https=OK" in out, out)
+            check("patched still works over https", "after/https=OK" in out, out)
+            # The cleanup contract: React needs a function or undefined, never
+            # a promise, or it will try to call it on unmount.
+            check("the guard path returns undefined, not a promise",
+                  "after/http/ret=undefined" in out, out)
+            check("the https path still returns the cleanup function",
+                  "after/https/ret=function" in out, out)
 
     print("\n" + "=" * 60)
     tail = f", {SKIPPED} SKIPPED" if SKIPPED else ""

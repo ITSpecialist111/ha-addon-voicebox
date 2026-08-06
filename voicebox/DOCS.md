@@ -504,6 +504,35 @@ A quick way to tell the two failure modes apart in the browser console:
 
 Rebuilding the add-on re-applies the patch.
 
+### "Cannot read properties of undefined (reading 'getUserMedia')" (fixed in 0.7.6)
+
+Opening **Create Voice** replaced the whole panel with *Something went wrong!*
+and that message.
+
+It was not the record button. Behind it sits a live waveform preview that asks
+for the microphone **as soon as the dialog opens**, before you click anything.
+
+`navigator.mediaDevices` only exists in a **secure context** - `https://`,
+`localhost`, or `127.0.0.1`. A private LAN address is **not** one, so over
+`http://192.168.x.x:8123` the property is simply absent and the call throws
+immediately. The upstream code does have a `.catch()`, but a `catch` only
+handles a *rejected promise*; this throws *synchronously*, before any promise
+exists, so nothing caught it and React tore the panel down.
+
+0.7.6 guards that call. The panel now opens normally on plain HTTP, with a note
+in the browser console instead of a crash.
+
+**Recording still needs a secure context** - that is a browser rule, not
+something the add-on can lift. You have two ways round it:
+
+- **Open Home Assistant over HTTPS.** The ingress frame is same-origin with
+  Home Assistant and carries no restrictive `sandbox` or `allow` attribute, so
+  the microphone works there and you get the usual browser permission prompt.
+- **Upload a clip instead.** Voice cloning never needed the microphone:
+  record 10-20 seconds on a phone, then create the profile and attach the file
+  with the text that was spoken. A phone microphone is usually the better
+  source anyway.
+
 ### Blank on one address but fine on another (fixed in 0.7.5)
 
 The classic report: the panel works on `http://<ip>:8123` but is blank through
