@@ -533,42 +533,80 @@ something the add-on can lift. You have two ways round it:
   with the text that was spoken. A phone microphone is usually the better
   source anyway.
 
-### Blank on one address but fine on another (fixed in 0.7.5)
+### Blank on one address but fine on another
 
 The classic report: the panel works on `http://<ip>:8123` but is blank through
 an external hostname, or vice versa — and *nothing* on the server side can be
 made to reproduce it.
 
 That asymmetry is the diagnosis. **HTTP caches are keyed by origin**, so the two
-addresses hold entirely separate copies of the frontend.
+addresses hold entirely separate copies of the frontend. One of them is stale.
 
-Upstream serves the bundle with an `ETag` and a `Last-Modified` but **no
-`Cache-Control` at all**. RFC 9111 then permits a browser to apply *heuristic*
-freshness — roughly 10% of the age of the file — and reuse its stored copy
-**without revalidating**. Worse, the bundle filename comes from the upstream
-Vite build (`assets/index-<hash>.js`) and does **not change when this add-on is
-updated**, so the stale copy sits at exactly the same URL as the new one.
-
-An add-on update therefore leaves one origin still running the *previous*
-frontend. If that copy predates the ingress patches above, its router has no
+The reason it is fatal rather than merely old is that the bundle filename comes
+from the upstream Vite build (`assets/index-<hash>.js`) and that hash is baked
+into the published image — it does **not change when this add-on is updated**.
+A stale copy therefore sits at exactly the same URL as the new one. If the copy
+a browser is holding predates the ingress patches above, its router has no
 basepath, matches nothing under `/api/hassio_ingress/<token>/`, and renders
-**nothing at all** — a white panel, no error, no failed request in the network
-tab, because the browser never asked the server for anything.
+**nothing at all** — a white panel, no error, and no failed request in the
+network tab, because the browser never asked the server for anything.
 
-`patch-frontend.py` now adds a second middleware, `_vb_no_stale_frontend`, that
-sends `Cache-Control: no-cache` on `/`, `/index.html`, `/assets/*` and every SPA
-route.
+#### Why the `no-cache` header alone was not enough
 
-`no-cache` does **not** mean "do not store". The file is still cached; the
-browser simply has to revalidate it, and the `ETag` upstream already sends
-answers that with a **304 and no body**. The cost is one conditional request per
-asset per load. The alternative — content-hashing the filenames — would have
-risked a 404 (and the same blank page) for any browser still holding an
-`index.html` that referenced the old name.
+0.7.5 added a middleware, `_vb_no_stale_frontend`, that sends
+`Cache-Control: no-cache` on `/`, `/index.html`, `/assets/*` and every SPA
+route. That is correct and still present, and it is sufficient on a direct LAN
+connection.
 
-**If you are on a version before 0.7.5, or you updated from one:** force a
-reload once — `Ctrl` + `Shift` + `R` (`Cmd` + `Shift` + `R` on macOS) — on each
-address you use. After 0.7.5 this stops recurring.
+It is **not** sufficient behind a reverse proxy or CDN, which was measured
+through a Cloudflare tunnel:
+
+| resource | `Cache-Control` the browser actually received | `cf-cache-status` |
+|---|---|---|
+| `index.html` | `no-cache` | `DYNAMIC` |
+| `assets/index-<hash>.js` | **`max-age=14400`** (4 hours) | `MISS` → `HIT` |
+
+The add-on sent `no-cache` for that exact file — verifiable on the direct port
+— and the edge replaced it, because CDNs apply their own Browser Cache TTL to
+static file extensions. A permanently-fresh `index.html` then keeps pointing at
+a bundle the browser already holds and will not re-request.
+
+No response header the add-on can send fixes that, because the add-on is not
+the last thing to touch the headers. Only the **URL** can, and the URL is the
+one thing an intermediary will not rewrite.
+
+#### What 0.7.7 does
+
+`patch-frontend.py` now fingerprints the asset filenames at build time. Each
+file referenced from `index.html` is renamed to include a short hash of its own
+contents — `index-DPaWep75.js` becomes `index-DPaWep75.vb1a2b3c4d.js` — and the
+references in `index.html` are rewritten to match.
+
+This makes the URL change **whenever, and only whenever, the bytes change**. A
+cached copy of the old file is now simply irrelevant rather than actively
+harmful: nothing asks for it any more. The build fails if a rename cannot be
+carried out cleanly, so a half-fingerprinted tree cannot ship.
+
+#### The one caveat, stated honestly
+
+Earlier revisions of this document rejected filename hashing on the grounds that
+a browser still holding the *old* `index.html` would 404 on the new asset name.
+That risk is real, but it is much smaller than it first appears and it is worth
+paying:
+
+- `index.html` is served `no-cache`, and it is the one resource a CDN treats as
+  dynamic rather than static, so it is revalidated on essentially every load.
+- The 404 is a **clean 404**, not an HTML page. The SPA deep-link fallback
+  requires both `text/html` in the `Accept` header and a known SPA route, so an
+  asset request cannot be answered with `index.html` by mistake.
+- The worst case is therefore one hard reload, once, at the moment of upgrade
+  — rather than a blank page that persists for hours and recurs on every
+  subsequent update.
+
+**If you updated from a version before 0.7.7 and still see a blank panel:**
+force a reload once — `Ctrl` + `Shift` + `R` (`Cmd` + `Shift` + `R` on macOS).
+From 0.7.7 onward this stops recurring, on every address, with or without a CDN
+in the path.
 
 The middleware is scoped deliberately: generated audio is large and immutable,
 so it is left cacheable. Marking it `no-cache` would re-download every clip on

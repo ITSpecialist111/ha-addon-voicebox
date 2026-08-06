@@ -9,6 +9,7 @@ and these stop matching, that is exactly the signal we want.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -239,6 +240,23 @@ def backend_of(root: pathlib.Path) -> str:
     return (root / "backend" / "main.py").read_text(encoding="utf-8")
 
 
+def entry_js(root: pathlib.Path, front_dir: str = "frontend/dist") -> pathlib.Path:
+    """The patched entry bundle.
+
+    Its name now carries a content fingerprint, so the tests cannot hard-code
+    it. Resolving it by glob also means a scenario fails loudly if the rename
+    produced two bundles or none, rather than reading a stale file that the
+    patcher had already moved aside.
+    """
+    assets = root.joinpath(*front_dir.split("/")) / "assets"
+    found = sorted(assets.glob("index-*.js"))
+    if len(found) != 1:
+        raise AssertionError(
+            f"expected exactly one entry bundle, found {[p.name for p in found]}"
+        )
+    return found[0]
+
+
 def run(root: pathlib.Path, *extra: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), str(root), *extra],
@@ -254,6 +272,9 @@ from starlette.testclient import TestClient
 
 HTML = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 ANY = "*/*"
+# The entry bundle's name carries a content fingerprint, so it cannot be
+# hard-coded here either.
+_entry = sorted(pathlib.Path(sys.argv[1]).rglob("assets/index-*.js"))[0].name
 cases = [
     ("reload_models", "/models", HTML),
     ("reload_stories", "/stories", HTML),
@@ -262,7 +283,7 @@ cases = [
     ("api_health", "/health", HTML),
     ("api_models", "/models", ANY),
     ("root", "/", HTML),
-    ("asset", "/assets/index-DPaWep75.js", ANY),
+    ("asset", f"/assets/{_entry}", ANY),
 ]
 out = {}
 with TestClient(main.app) as c:
@@ -323,15 +344,15 @@ def main() -> int:
         check("exits 0", r.returncode == 0, r.stderr)
 
         index = (root / "frontend/dist/index.html").read_text(encoding="utf-8")
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
 
-        check("asset src made relative", 'src="assets/index-DPaWep75.js"' in index)
-        check("stylesheet href made relative", 'href="assets/index-DfXZrYe2.css"' in index)
+        check("asset src made relative", 'src="assets/index-DPaWep75.vb' in index)
+        check("stylesheet href made relative", 'href="assets/index-DfXZrYe2.vb' in index)
         check("favicon made relative", 'href="vite.svg"' in index)
         check("no absolute src=/href= left", not re.search(r'(?:src|href)="/(?!/)', index))
         check("base snippet injected", "__VB_BASE__" in index)
         check("snippet precedes the module script",
-              index.index("__VB_BASE__") < index.index("index-DPaWep75.js"))
+              index.index("__VB_BASE__") < index.index("index-DPaWep75.vb"))
         check("getBaseUrl rewritten",
               'getBaseUrl(){return window.__VB_BASE__||""}' in js)
         check("original getBaseUrl gone", "Mn.getState().serverUrl" not in js)
@@ -416,7 +437,7 @@ def main() -> int:
                   + ROUTER_JS + REAL_ROUTES_JS + MIC_JS)
         root = make_fixture(pathlib.Path(td), js=spaced)
         r = run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("exits 0", r.returncode == 0, r.stderr)
         check("rewritten", 'window.__VB_BASE__||""' in js)
 
@@ -428,7 +449,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = make_fixture(pathlib.Path(td))
         r = run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("exits 0", r.returncode == 0, r.stderr)
         check("basepath added to the router",
               'routeTree:$J,basepath:window.__VB_BASE__||"/"' in js)
@@ -443,7 +464,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = make_fixture(pathlib.Path(td))
         r = run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("exits 0", r.returncode == 0, r.stderr)
         check("logo URL rebased",
               '(window.__VB_BASE__||"")+"/assets/voicebox-logo-DQ1k8iIe.png"' in js)
@@ -455,9 +476,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = make_fixture(pathlib.Path(td))
         run(root)
-        first = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        first = (entry_js(root)).read_text(encoding="utf-8")
         again = run(root)
-        second = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        second = (entry_js(root)).read_text(encoding="utf-8")
         check("second run exits 0", again.returncode == 0, again.stderr)
         check("bundle unchanged", first == second)
         check("exactly one basepath",
@@ -475,7 +496,7 @@ def main() -> int:
                  + ";q2=Y3({routeTree:bb});")
         root = make_fixture(pathlib.Path(td), js=mixed)
         r = run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("exits 0", r.returncode == 0, r.stderr)
         check("all three routers have a basepath",
               js.count("{routeTree:") == js.count('basepath:window.__VB_BASE__||"/"'))
@@ -505,7 +526,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = make_fixture(pathlib.Path(td))
         r = run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("exits 0", r.returncode == 0, r.stderr)
         check("both streams rebased",
               js.count('${window.__VB_BASE__||""}/models/progress/') == 2)
@@ -520,7 +541,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = make_fixture(pathlib.Path(td))
         run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("default origin is not blanked", 'serverUrl:""' not in js)
         check("truthy in both contexts",
               'serverUrl:(window.__VB_BASE__||location.origin)' in js)
@@ -547,7 +568,7 @@ def main() -> int:
         # --check would rightly reject it, and the scenario would pass while
         # testing nothing but scenario 3 over again.
         check("setup patched cleanly", setup.returncode == 0, setup.stderr[-200:])
-        jsp = root / "frontend/dist/assets/index-DPaWep75.js"
+        jsp = entry_js(root)
         before = jsp.read_text(encoding="utf-8")
         after = before.replace(',basepath:window.__VB_BASE__||"/"', "")
         # And without this, a patcher that stopped emitting the basepath would
@@ -1109,7 +1130,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = make_fixture(pathlib.Path(td))
         r = run(root)
-        js = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        js = (entry_js(root)).read_text(encoding="utf-8")
         check("exits 0", r.returncode == 0, r.stderr)
         check("says what it guarded",
               "microphone preview" in r.stdout, r.stdout[-300:])
@@ -1148,9 +1169,9 @@ def main() -> int:
         # longer describes what is in the file.
         root = make_fixture(pathlib.Path(td))
         run(root)
-        first = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        first = (entry_js(root)).read_text(encoding="utf-8")
         r = run(root)
-        again = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(encoding="utf-8")
+        again = (entry_js(root)).read_text(encoding="utf-8")
         check("a second run exits 0", r.returncode == 0, r.stderr)
         check("says it was already guarded",
               "already guarded" in r.stdout, r.stdout[-300:])
@@ -1247,11 +1268,11 @@ def main() -> int:
     else:
         with tempfile.TemporaryDirectory() as td:
             root = make_fixture(pathlib.Path(td))
-            before = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(
+            before = (entry_js(root)).read_text(
                 encoding="utf-8")
             r = run(root)
             check("exits 0", r.returncode == 0, r.stderr)
-            after = (root / "frontend/dist/assets/index-DPaWep75.js").read_text(
+            after = (entry_js(root)).read_text(
                 encoding="utf-8")
 
             harness = pathlib.Path(td) / "harness.js"
@@ -1277,6 +1298,268 @@ def main() -> int:
                   "after/http/ret=undefined" in out, out)
             check("the https path still returns the cleanup function",
                   "after/https/ret=function" in out, out)
+
+    # ------------------------------------------------------------------
+    # 28. cache-busting: the asset URL changes when its bytes change
+    #
+    # Measured through Graham's Cloudflare tunnel, the browser is handed
+    # Cache-Control: max-age=14400 for the entry bundle - a four-hour browser
+    # cache - no matter that the add-on itself sends no-cache. index.html is
+    # NOT cached (cf-cache-status: DYNAMIC), so a genuinely fresh page keeps
+    # pointing at a bundle the browser already holds and will not re-request.
+    # Headers cannot fix that; only the URL can. Upstream's Vite build names
+    # the entry chunk from upstream's sources, so it is byte-identical across
+    # every add-on release while we rewrite its contents on every build.
+    #
+    # These assertions are about the PROPERTY that makes it work - the name
+    # tracks the content - not about any particular hash.
+    # ------------------------------------------------------------------
+    scenario("28. assets are fingerprinted so a stale cache cannot win")
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td))
+        r = run(root)
+        check("exits 0", r.returncode == 0, r.stderr)
+
+        assets = root / "frontend" / "dist" / "assets"
+        index = (root / "frontend/dist/index.html").read_text(encoding="utf-8")
+
+        js = entry_js(root)
+        check("the entry bundle was renamed",
+              re.fullmatch(r"index-DPaWep75\.vb[0-9a-f]{8}\.js", js.name) is not None,
+              js.name)
+        # The digest is recomputed here from the file's bytes, in the test, with
+        # no reference to the patcher's own helper. If the two disagree the name
+        # is decorative and the cache would never be busted.
+        want = hashlib.sha256(js.read_bytes()).hexdigest()[:8]
+        check("the fingerprint really is a digest of the shipped bytes",
+              f".vb{want}." in js.name, f"{js.name} vs {want}")
+
+        check("index.html points at the fingerprinted name",
+              f'src="assets/{js.name}"' in index, index[:400])
+        css = sorted(assets.glob("index-*.css"))
+        check("the stylesheet is fingerprinted too",
+              len(css) == 1 and ".vb" in css[0].name, [p.name for p in css])
+        check("index.html points at the fingerprinted stylesheet",
+              f'href="assets/{css[0].name}"' in index, index[:400])
+
+        # The old URL must be GONE, not merely superseded. A file left behind at
+        # the old name would keep serving the stale bundle to every browser that
+        # still has the old index.html - which is the exact failure being fixed.
+        check("the un-fingerprinted name no longer exists on disk",
+              not (assets / "index-DPaWep75.js").exists())
+        check("nothing still references the un-fingerprinted name",
+              'assets/index-DPaWep75.js"' not in index)
+
+        # Idempotency. The build runs the patcher over a tree it may have
+        # patched before; a name that grew a second suffix each time would
+        # break the moment anything re-ran.
+        r2 = run(root)
+        check("a second run exits 0", r2.returncode == 0, r2.stderr)
+        js2 = entry_js(root)
+        check("the name is stable across runs", js2.name == js.name,
+              f"{js.name} -> {js2.name}")
+        check("suffixes do not stack", js2.name.count(".vb") == 1, js2.name)
+        check("index.html is unchanged by the second run",
+              (root / "frontend/dist/index.html").read_text(encoding="utf-8") == index)
+
+    # The whole point: different bytes MUST produce a different URL. A constant
+    # or name-derived fingerprint would satisfy every assertion above and still
+    # ship the same URL forever.
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td))
+        check("baseline exits 0", run(root).returncode == 0)
+        first = entry_js(root).name
+
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td), js=REAL_JS + "\n// one more byte\n")
+        check("modified build exits 0", run(root).returncode == 0)
+        second = entry_js(root).name
+
+    check("changing the bundle changes its URL", first != second,
+          f"{first} == {second}")
+
+    # verify() must reject a tree whose names have drifted from their contents,
+    # because that is what a disabled rename step, or an edit made after the
+    # rename, actually looks like on disk.
+    scenario("28b. verify() rejects a fingerprint that no longer matches")
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td))
+        check("patch exits 0", run(root).returncode == 0)
+        js = entry_js(root)
+        js.write_text(js.read_text(encoding="utf-8") + "\n// edited after\n",
+                      encoding="utf-8")
+        r = run(root, "--check")
+        check("--check fails on a stale fingerprint", r.returncode != 0,
+              (r.stdout + r.stderr)[-300:])
+        check("...and says the fingerprint does not match its bytes",
+              "does not match its" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-300:])
+
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td))
+        check("patch exits 0", run(root).returncode == 0)
+        idx = root / "frontend/dist/index.html"
+        idx.write_text(
+            idx.read_text(encoding="utf-8").replace(
+                entry_js(root).name, "index-DPaWep75.vbdeadbeef.js"),
+            encoding="utf-8")
+        r = run(root, "--check")
+        check("--check fails when the referenced asset is missing",
+              r.returncode != 0, (r.stdout + r.stderr)[-300:])
+        check("...and says the page would load nothing",
+              "not on disk" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-300:])
+
+    # Fail-closed: a chunk that imports the entry by name would 404 after a
+    # rename, so the patcher must refuse rather than ship a broken bundle.
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td))
+        (root / "frontend/dist/assets/lazy.js").write_text(
+            'import("./index-DPaWep75.js")', encoding="utf-8")
+        r = run(root)
+        check("refuses to rename a chunk another bundle imports by name",
+              r.returncode != 0, (r.stdout + r.stderr)[-300:])
+        check("...and names the dynamic import as the reason",
+              "dynamic import" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-300:])
+
+    # ------------------------------------------------------------------
+    # 28c. the fingerprinting is LOAD-BEARING
+    #
+    # Everything above passes just as happily against a patcher that renames
+    # nothing, if the assertions are read but the code is not run. Each mutation
+    # disables one part of the mechanism and the build must go red. Two of these
+    # are caught only because verify() recomputes the digest with a different
+    # spelling than the rename step used.
+    # ------------------------------------------------------------------
+    scenario("28c. a build that stops busting caches cannot pass")
+    FP_MUTATIONS = [
+        ("the rename never happens",
+         "        (assets / name).rename(assets / new_name)\n",
+         "        pass\n"),
+        ("the fingerprint is a constant, so every release shares a URL",
+         '    return hashlib.sha256(data).hexdigest()[:FINGERPRINT_LEN]',
+         '    return "deadbeef"'),
+        ("fingerprinting is never called",
+         "        notes += fingerprint_assets(frontend)\n",
+         ""),
+        ("index.html is left pointing at the old name",
+         """        html = html.replace(f'assets/{name}"', f'assets/{new_name}"')""",
+         """        html = html.replace(f'assets/{name}"', f'assets/{name}"')"""),
+        # The one edit that used to defeat BOTH sides at once. fingerprint_assets()
+        # and verify() once shared this regex, so narrowing the alternation hid the
+        # entry bundle from the rename step and from the check meant to catch the
+        # rename step failing - and the build reported success with the stale-cache
+        # bug fully intact. verify() now derives its own work list from the
+        # assets/ path rather than the attribute name, so it still sees what the
+        # rename step was made blind to.
+        ("only href is recognised, so the entry bundle is never renamed",
+         'RE_INDEX_ASSET = re.compile(r\'(?:src|href)="assets/([^"]+)"\')',
+         'RE_INDEX_ASSET = re.compile(r\'(?:href)="assets/([^"]+)"\')'),
+        ("only src is recognised, so the stylesheet is never renamed",
+         'RE_INDEX_ASSET = re.compile(r\'(?:src|href)="assets/([^"]+)"\')',
+         'RE_INDEX_ASSET = re.compile(r\'(?:src)="assets/([^"]+)"\')'),
+    ]
+    src = SCRIPT.read_text(encoding="utf-8")
+    for label, frm, to in FP_MUTATIONS:
+        # A target that matches nothing would make the mutation a no-op and the
+        # "build fails" assertion meaningless. Two of the mic mutations were
+        # silently doing exactly that until this precondition was added.
+        check(f"[{label}] the target appears exactly once",
+              src.count(frm) == 1, f"count={src.count(frm)}")
+        with tempfile.TemporaryDirectory() as td:
+            root = make_fixture(pathlib.Path(td))
+            broken = src.replace(frm, to, 1)
+            check(f"[{label}] the mutated patcher really differs", broken != src)
+            mutant = pathlib.Path(td) / "mutant.py"
+            mutant.write_text(broken, encoding="utf-8")
+            r = subprocess.run([sys.executable, str(mutant), str(root)],
+                               capture_output=True, text=True)
+            check(f"[{label}] the build fails", r.returncode != 0,
+                  (r.stdout + r.stderr)[-300:])
+            check(f"[{label}] ...and says why the cache would go stale",
+                  any(w in (r.stdout + r.stderr) for w in
+                      ("fingerprint", "not on disk", "update the reference")),
+                  (r.stdout + r.stderr)[-300:])
+
+    # ------------------------------------------------------------------
+    # 28d. an asset named twice is renamed once, not renamed then lost
+    #
+    # A <link rel="modulepreload"> beside the <script> is ordinary Vite output.
+    # Acting on the reference list without de-duplicating it renamed the file on
+    # the first pass and then went looking for it again on the second, which
+    # failed AFTER the rename had already happened - leaving files under new
+    # names and index.html still naming the old ones.
+    # ------------------------------------------------------------------
+    scenario("28d. an asset referenced twice does not wedge the tree")
+    DUP_INDEX = REAL_INDEX.replace(
+        '    <script type="module" crossorigin src="/assets/index-DPaWep75.js"></script>\n',
+        '    <link rel="modulepreload" crossorigin href="/assets/index-DPaWep75.js">\n'
+        '    <script type="module" crossorigin src="/assets/index-DPaWep75.js"></script>\n')
+    check("the fixture really does name the asset twice",
+          DUP_INDEX.count("assets/index-DPaWep75.js") == 2)
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td), index=DUP_INDEX)
+        r = run(root)
+        check("exits 0", r.returncode == 0, (r.stdout + r.stderr)[-400:])
+        idx = (root / "frontend/dist/index.html").read_text(encoding="utf-8")
+        js = entry_js(root)
+        check("both references were updated",
+              idx.count(f"assets/{js.name}") == 2, idx[:500])
+        check("no reference to the old name survives",
+              'assets/index-DPaWep75.js"' not in idx, idx[:500])
+        check("--check passes on the result", run(root, "--check").returncode == 0)
+
+    # ------------------------------------------------------------------
+    # 28e. a refusal leaves the tree exactly as it was found
+    #
+    # The dynamic-import guard fires part-way through the asset list. If renames
+    # were applied as we went, the assets ahead of the failure would already be
+    # renamed on disk while index.html still named them the old way - and every
+    # later run would then fail looking up names that no longer exist, with the
+    # original cause long since removed. A failed build must be retryable.
+    # ------------------------------------------------------------------
+    scenario("28e. a refusal is recoverable, not a wedged tree")
+    CSS_FIRST = REAL_INDEX.replace(
+        '    <script type="module" crossorigin src="/assets/index-DPaWep75.js"></script>\n'
+        '    <link rel="stylesheet" crossorigin href="/assets/index-DfXZrYe2.css">\n',
+        '    <link rel="stylesheet" crossorigin href="/assets/index-DfXZrYe2.css">\n'
+        '    <script type="module" crossorigin src="/assets/index-DPaWep75.js"></script>\n')
+    check("the fixture really does list the stylesheet first",
+          CSS_FIRST.index("index-DfXZrYe2.css") < CSS_FIRST.index("index-DPaWep75.js"))
+    with tempfile.TemporaryDirectory() as td:
+        root = make_fixture(pathlib.Path(td), index=CSS_FIRST)
+        assets = root / "frontend" / "dist" / "assets"
+        (assets / "lazy.js").write_text('import("./index-DPaWep75.js")',
+                                        encoding="utf-8")
+        before_names = sorted(p.name for p in assets.iterdir())
+        before_index = (root / "frontend/dist/index.html").read_text(encoding="utf-8")
+
+        r = run(root)
+        check("the build fails", r.returncode != 0, (r.stdout + r.stderr)[-300:])
+        check("...naming the dynamic import as the reason",
+              "dynamic import" in (r.stdout + r.stderr), (r.stdout + r.stderr)[-300:])
+        check("NOTHING on disk was renamed",
+              sorted(p.name for p in assets.iterdir()) == before_names,
+              sorted(p.name for p in assets.iterdir()))
+        # patch_index() runs first and legitimately rewrites index.html (absolute
+        # paths made relative, base snippet injected) before fingerprinting is
+        # even reached, so the file is not expected to be byte-identical. What
+        # must not have happened is a fingerprinted name being committed while
+        # the matching rename was refused - that is the inconsistency that made
+        # the tree unrecoverable.
+        after_index = (root / "frontend/dist/index.html").read_text(encoding="utf-8")
+        check("no fingerprinted name was written to index.html",
+              ".vb" not in after_index, after_index[:500])
+        check("index.html still names the assets that are still on disk",
+              'assets/index-DPaWep75.js"' in after_index
+              and 'assets/index-DfXZrYe2.css"' in after_index, after_index[:500])
+
+        # Remove the cause and the very same tree must now build.
+        (assets / "lazy.js").unlink()
+        r2 = run(root)
+        check("the retry succeeds once the cause is removed",
+              r2.returncode == 0, (r2.stdout + r2.stderr)[-400:])
+        check("--check passes on the retried result",
+              run(root, "--check").returncode == 0)
 
     print("\n" + "=" * 60)
     tail = f", {SKIPPED} SKIPPED" if SKIPPED else ""

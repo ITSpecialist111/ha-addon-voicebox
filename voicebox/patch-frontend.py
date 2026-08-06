@@ -735,6 +735,148 @@ def patch_index(index: pathlib.Path) -> list[str]:
     return notes
 
 
+# --- cache-busting fingerprints ---------------------------------------------
+#
+# Upstream's Vite build names the entry bundle assets/index-<hash>.js, where
+# <hash> is derived from UPSTREAM's sources. This add-on rewrites the bytes of
+# that file on every single build, but the name never changes. A URL whose
+# content changes while its name does not is the classic cache-poisoning shape,
+# and it has produced a blank ingress panel twice now.
+#
+# It CANNOT be fixed with response headers, because we do not control every hop.
+# Measured through a Cloudflare tunnel, the browser is told
+#
+#     cache-control: max-age=14400          (4 hours)
+#
+# for assets/*.js even though _vb_no_stale_frontend below sets no-cache on
+# exactly that path: the CDN caches static extensions and applies its own
+# browser-cache TTL on top. index.html is not cached (no extension, DYNAMIC),
+# so the page itself is always fresh - and a fresh index.html that points at an
+# unchanged asset URL still loads the STALE bundle out of the browser's cache.
+# That asymmetry is the whole bug.
+#
+# Caches are also keyed by origin, which is why this shows up as "fine on the
+# LAN address, blank through the external hostname": the two origins simply
+# hold different copies. No server-side test can observe it, because the
+# browser never sends the request.
+#
+# So change the one thing we do control: the URL. A URL that has never been
+# requested cannot be in anybody's cache - not the browser's, not a service
+# worker's, not the CDN's edge, not a corporate proxy's. Deriving the name from
+# a digest of the PATCHED bytes makes every release self-busting, and makes a
+# release that changed nothing cost nothing.
+RE_INDEX_ASSET = re.compile(r'(?:src|href)="assets/([^"]+)"')
+RE_FINGERPRINT = re.compile(r"\.vb[0-9a-f]{8}(?=\.[^.]+\Z)")
+
+# Used ONLY by verify(), and deliberately not RE_INDEX_ASSET.
+#
+# RE_INDEX_ASSET names the attributes it will look at. fingerprint_assets()
+# uses it to decide what to rename, so narrowing that one alternation - src|href
+# down to href, say - hides the entry bundle from the rename step AND from the
+# check that is supposed to catch the rename step failing. One token, both sides
+# blind, exit code 0, and the stale-cache bug straight back in production. Two
+# spellings of the digest are not enough if both sides agree on the same wrong
+# work list.
+#
+# So this one keys off the assets/ path itself and ignores the attribute
+# entirely. It sees strictly more than the rename step can, which is the
+# property that matters: anything the page might load, this will notice.
+RE_ANY_ASSET_REF = re.compile(r"assets/([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9]+)")
+FINGERPRINT_LEN = 8
+
+
+def asset_fingerprint(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:FINGERPRINT_LEN]
+
+
+def fingerprinted_name(name: str, digest: str) -> str:
+    """index-DPaWep75.js -> index-DPaWep75.vb1a2b3c4d.js
+
+    Stripping any fingerprint already present first is what makes this
+    idempotent: the digest covers the file's bytes, not its name, so a second
+    run over unchanged content reproduces the same name rather than stacking a
+    second suffix onto it.
+    """
+    base = RE_FINGERPRINT.sub("", name)
+    stem, dot, suffix = base.rpartition(".")
+    if not dot:
+        return f"{base}.vb{digest}"
+    return f"{stem}.vb{digest}{dot}{suffix}"
+
+
+def fingerprint_assets(frontend: pathlib.Path) -> list[str]:
+    index_path = frontend / "index.html"
+    html = index_path.read_text(encoding="utf-8")
+    assets = frontend / "assets"
+
+    # dict.fromkeys de-duplicates while keeping order. index.html is entitled to
+    # name the same asset twice - a <link rel="modulepreload"> beside the
+    # <script> is the usual case - and acting on it twice would send the second
+    # pass looking for a file the first pass had already renamed away.
+    referenced = list(dict.fromkeys(RE_INDEX_ASSET.findall(html)))
+    if not referenced:
+        raise PatchError(
+            "index.html references no assets/ files, so there is nothing to "
+            "fingerprint. Refusing rather than silently skipping the only "
+            "defence against a stale cached bundle"
+        )
+
+    # PLAN EVERYTHING, THEN COMMIT. Every check that can fail runs, and the new
+    # index.html is built in memory, before a single file is renamed. A refusal
+    # therefore leaves the tree byte-for-byte as it was found.
+    #
+    # Renaming as we went would be unrecoverable rather than merely failed: the
+    # files would sit under their new names while index.html still named the old
+    # ones, and the first thing any later run does is look up the names
+    # index.html gives it - so every retry would fail on a tree that no longer
+    # matches its own manifest, with the original cause long since fixed.
+    notes: list[str] = []
+    planned: list[tuple[str, str]] = []
+    for name in referenced:
+        src = assets / name
+        if not src.is_file():
+            raise PatchError(
+                f"index.html references assets/{name}, which is not on disk"
+            )
+        new_name = fingerprinted_name(name, asset_fingerprint(src.read_bytes()))
+        if new_name == name:
+            notes.append(f"assets/{name}: fingerprint already current")
+            continue
+
+        # A chunk that other bundles import BY NAME cannot simply be renamed:
+        # rewriting those imports would change their bytes, and therefore their
+        # own fingerprints, after they had already been computed. Upstream's
+        # entry chunk is imported by nobody, so this should never fire - but if
+        # a future upstream build changes that, fail loudly instead of shipping
+        # a bundle whose dynamic imports 404.
+        stale = RE_FINGERPRINT.sub("", name)
+        for other in sorted(assets.glob("*.js")):
+            if other.name in (name, new_name):
+                continue
+            if stale in other.read_text(encoding="utf-8", errors="ignore"):
+                raise PatchError(
+                    f"assets/{other.name} refers to {stale} by name, so "
+                    "renaming it would break a dynamic import"
+                )
+        planned.append((name, new_name))
+
+    for name, new_name in planned:
+        before = html
+        html = html.replace(f'assets/{name}"', f'assets/{new_name}"')
+        if html == before:
+            raise PatchError(
+                f"cannot update the reference to assets/{name} in index.html, "
+                "so renaming it would leave the page loading nothing"
+            )
+
+    # Nothing above this line has touched the filesystem.
+    for name, new_name in planned:
+        (assets / name).rename(assets / new_name)
+        notes.append(f"assets/{name} -> assets/{new_name} (cache-busting)")
+    index_path.write_text(html, encoding="utf-8")
+    return notes
+
+
 def patch_bundles(assets: pathlib.Path) -> list[str]:
     notes = []
     total = 0
@@ -908,6 +1050,44 @@ def verify(frontend: pathlib.Path, root: pathlib.Path) -> None:
     ):
         raise PatchError("no bundle contains a router with an ingress basepath")
 
+    # Every asset the page pulls must carry a fingerprint that actually matches
+    # its bytes. Recomputing the digest here, rather than trusting the name, is
+    # what makes this a real check rather than a restatement of what the rename
+    # step just did: a name left behind by an edit that happened afterwards is
+    # caught, and so is a rename step that was disabled entirely.
+    referenced = list(dict.fromkeys(RE_ANY_ASSET_REF.findall(index)))
+    if not referenced:
+        raise PatchError("index.html references no assets/ files")
+    for name in referenced:
+        asset = assets / name
+        if not asset.is_file():
+            raise PatchError(
+                f"index.html references assets/{name}, which is not on disk - "
+                "the page would load nothing at all"
+            )
+        if not RE_FINGERPRINT.search(name):
+            raise PatchError(
+                f"assets/{name} carries no cache-busting fingerprint. Its URL "
+                "would be identical in every release while its bytes change, "
+                "so a browser, a service worker or a CDN is entitled to serve "
+                "a stale copy - measured through a CDN the browser is told to "
+                "keep it for 4 hours regardless of what this add-on sends"
+            )
+        # Spelled out longhand ON PURPOSE, rather than calling
+        # asset_fingerprint(). If this check reused the very function the
+        # rename step used, a mutation to that function - returning a constant,
+        # say - would change both sides identically and this would still pass,
+        # while every release shipped the same unchanging URL and the bug came
+        # straight back. Two independent spellings cannot be defeated by one
+        # edit. This repo has shipped two present-but-inert patches already.
+        want = hashlib.sha256(asset.read_bytes()).hexdigest()[:8]
+        if f".vb{want}" not in name:
+            raise PatchError(
+                f"assets/{name} carries a fingerprint that does not match its "
+                f"bytes (which hash to {want}), so caches would not be busted "
+                "by this release"
+            )
+
     routes = spa_routes(assets)
     if not routes:
         raise PatchError("found no client-side routes in the bundle")
@@ -949,6 +1129,7 @@ def main(argv: list[str]) -> int:
 
         notes = patch_index(frontend / "index.html")
         notes += patch_bundles(frontend / "assets")
+        notes += fingerprint_assets(frontend)
         notes += patch_backend(root, spa_routes(frontend / "assets"))
         verify(frontend, root)
     except PatchError as exc:

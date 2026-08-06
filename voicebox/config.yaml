@@ -1,5 +1,5 @@
 name: Voicebox
-version: "0.7.6"
+version: "0.7.7"
 slug: voicebox
 description: >-
   Local AI voice studio — text-to-speech, voice cloning and transcription.
