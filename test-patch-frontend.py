@@ -1481,6 +1481,83 @@ def main() -> int:
                   (r.stdout + r.stderr)[-300:])
 
     # ------------------------------------------------------------------
+    # 28f. the import guard must search for the name the file is about to LOSE
+    #
+    # The guard scanned sibling bundles for RE_FINGERPRINT.sub("", name) rather
+    # than for name. On upstream's own output those two strings are identical,
+    # so every assertion above - and the real-bundle dry run - passed with
+    # either spelling. They diverge the moment an asset already carries a
+    # fingerprint, and there the guard searched for a string that is on
+    # nobody's disk, matched nothing, and allowed exactly the rename it exists
+    # to prevent. The shipped bundle would then import a file that had been
+    # renamed out from under it: a 404, a blank panel, and "verified" in the
+    # build log - the present-but-inert shape this whole file guards against.
+    #
+    # Reachability today is nil, because Vite does not emit names containing
+    # ".vb<8 hex>."; this pins the behaviour so a future upstream change cannot
+    # quietly make it reachable.
+    # ------------------------------------------------------------------
+    scenario("28f. the import guard searches for the name that is on disk")
+    FP_NAME = "index-DPaWep75.vb0123abcd.js"
+    FP_INDEX = REAL_INDEX.replace("index-DPaWep75.js", FP_NAME)
+    check("the fixture names an already-fingerprinted asset",
+          FP_NAME in FP_INDEX and "index-DPaWep75.js" not in FP_INDEX)
+
+    def fingerprinted_fixture(base):
+        """A tree whose entry bundle already carries a fingerprint, and which
+        another chunk imports by that current name."""
+        root = make_fixture(base, index=FP_INDEX)
+        a = root / "frontend" / "dist" / "assets"
+        (a / "index-DPaWep75.js").rename(a / FP_NAME)
+        (a / "lazy.js").write_text(f'import("./{FP_NAME}")', encoding="utf-8")
+        return root
+
+    with tempfile.TemporaryDirectory() as td:
+        root = fingerprinted_fixture(pathlib.Path(td))
+        r = run(root)
+        out = r.stdout + r.stderr
+        check("refuses to rename a fingerprinted chunk another bundle imports",
+              r.returncode != 0, out[-300:])
+        check("...and names the dynamic import as the reason",
+              "dynamic import" in out, out[-300:])
+        check("...and reports a name that is actually on disk",
+              FP_NAME in out, out[-300:])
+        check("...and left the asset where it was",
+              (root / "frontend" / "dist" / "assets" / FP_NAME).is_file())
+
+    # ...and that needle is load-bearing. This is the one mutation in the file
+    # whose signature is a build that SUCCEEDS: the guard is the only thing
+    # standing between a renamed chunk and a dynamic import pointing at
+    # nothing, so there is no second line of defence to go red. What proves it
+    # load-bearing is the artefact the mutant ships - a bundle importing a file
+    # that is no longer on disk, with "verified" in the log. On the ordinary
+    # fixture the two spellings are indistinguishable, which is exactly why 297
+    # assertions and a real-bundle dry run all passed with the defect present.
+    GUARD_FROM = ('            if name in other.read_text('
+                  'encoding="utf-8", errors="ignore"):')
+    GUARD_TO = ('            stale = RE_FINGERPRINT.sub("", name)\n'
+                '            if stale in other.read_text('
+                'encoding="utf-8", errors="ignore"):')
+    check("[guard needle] the target appears exactly once",
+          src.count(GUARD_FROM) == 1, f"count={src.count(GUARD_FROM)}")
+    with tempfile.TemporaryDirectory() as td:
+        root = fingerprinted_fixture(pathlib.Path(td))
+        broken = src.replace(GUARD_FROM, GUARD_TO, 1)
+        check("[guard needle] the mutated patcher really differs", broken != src)
+        mutant = pathlib.Path(td) / "mutant.py"
+        mutant.write_text(broken, encoding="utf-8")
+        r = subprocess.run([sys.executable, str(mutant), str(root)],
+                           capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        a = root / "frontend" / "dist" / "assets"
+        check("[guard needle] the de-fingerprinted needle lets the rename through",
+              r.returncode == 0, out[-400:])
+        check("[guard needle] ...leaving lazy.js importing a file that is gone",
+              FP_NAME in (a / "lazy.js").read_text(encoding="utf-8")
+              and not (a / FP_NAME).is_file())
+        check("[guard needle] ...while reporting the build verified", "verified" in out)
+
+    # ------------------------------------------------------------------
     # 28d. an asset named twice is renamed once, not renamed then lost
     #
     # A <link rel="modulepreload"> beside the <script> is ordinary Vite output.

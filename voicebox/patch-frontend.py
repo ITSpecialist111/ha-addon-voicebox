@@ -849,13 +849,19 @@ def fingerprint_assets(frontend: pathlib.Path) -> list[str]:
         # entry chunk is imported by nobody, so this should never fire - but if
         # a future upstream build changes that, fail loudly instead of shipping
         # a bundle whose dynamic imports 404.
-        stale = RE_FINGERPRINT.sub("", name)
+        # The needle is `name`: the name this file carries on disk right now,
+        # and therefore the only name anything can be importing it by. It was
+        # once a de-fingerprinted variant of that - which is equal to `name` on
+        # upstream's own output, and so looked correct and tested correct, but
+        # is a string on nobody's disk the moment an asset already carries a
+        # fingerprint. It then matched nothing and waved through precisely the
+        # rename this guard exists to stop.
         for other in sorted(assets.glob("*.js")):
             if other.name in (name, new_name):
                 continue
-            if stale in other.read_text(encoding="utf-8", errors="ignore"):
+            if name in other.read_text(encoding="utf-8", errors="ignore"):
                 raise PatchError(
-                    f"assets/{other.name} refers to {stale} by name, so "
+                    f"assets/{other.name} refers to {name} by name, so "
                     "renaming it would break a dynamic import"
                 )
         planned.append((name, new_name))
